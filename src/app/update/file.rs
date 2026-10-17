@@ -2243,14 +2243,15 @@ impl OpenCADStudio {
 
         // Open-time breakdown so regressions are visible immediately.
         // `total` is wall time from the Open click to here (post-xref,
-        // pre-first-frame); the phase figures are the background-thread
-        // parse/purge/cache spans plus the UI-thread xref resolve.
+        // pre-first-frame); the phase figures include the background-thread
+        // parse/purge/cache/geometry spans plus the UI-thread xref resolve.
         self.command_line.push_info(
             crate::tf!(
-                "  parse {}ms · purge {}ms · caches {}ms · xref {}ms · total {}ms",
+                "  parse {}ms · purge {}ms · caches {}ms · geometry {}ms · xref {}ms · total {}ms",
                 timings.parse_ms,
                 timings.purge_ms,
                 timings.caches_ms,
+                timings.finalize_ms,
                 timings.xref_ms,
                 total_ms
             )
@@ -2271,7 +2272,6 @@ impl OpenCADStudio {
         if let Some(prepared) = prepared_geometry {
             self.tabs[i].scene.install_prepared_open_geometry(prepared);
         }
-        // Pay for the interaction index here, not on the first hover.
         self.tabs[i].scene.warm_interaction_caches();
         self.tabs[i]
             .scene

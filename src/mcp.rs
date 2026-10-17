@@ -30,9 +30,9 @@ const MODERN_PROTOCOL_VERSION: &str = "2026-07-28";
 /// changes, so schema drift (new params, renamed tools) is always a conscious,
 /// reviewed edit — and clients can detect a stale bridge by comparing digests.
 ///
-/// `block_delete` gained its optional `force` parameter.
+/// Includes upstream keytips discovery and native model-space recognition.
 #[cfg(test)]
-const TOOL_SCHEMA_DIGEST: &str = "153b5104c95b564c1b956cb41febce2dc8ff767bcdc5b30371f9a7ccd72524f7";
+const TOOL_SCHEMA_DIGEST: &str = "4041c262a25c686cf49ffe99b426958a112c64efaf93025366a1909ed8238d6a";
 const MAX_REQUEST: usize = 1_048_576;
 const MAX_RESPONSE: u64 = 16 * 1024 * 1024;
 const CACHE_TTL_MS: u64 = 3_600_000;
@@ -50,6 +50,7 @@ const READ_OPS: &[&str] = &[
     "capabilities",
     "tools",
     "entities",
+    "recognize",
     "layers",
     "header",
     "properties",
@@ -1528,7 +1529,7 @@ fn resolve_batch_step(step: &Value, index: usize, results: &[Value]) -> Result<V
     Ok(resolved)
 }
 
-fn preflight_request(request: &Value) -> Value {
+pub(crate) fn preflight_request(request: &Value) -> Value {
     let result =
         required_string(request, "op").and_then(|op| validate_execute_request(request, op));
     match result {
@@ -1643,13 +1644,13 @@ const GUIDES: &[(&str, &str, &str)] = &[
     ),
 ];
 
-fn guide_resources() -> Vec<Value> {
+pub(crate) fn guide_resources() -> Vec<Value> {
     GUIDES.iter().map(|(name, title, _)| json!({
         "uri":format!("cad://guides/{name}"), "name":name, "title":title, "mimeType":"text/markdown"
     })).collect()
 }
 
-fn guide_resource(name: &str) -> Result<Value, String> {
+pub(crate) fn guide_resource(name: &str) -> Result<Value, String> {
     let (_, _, text) = GUIDES.iter().find(|(key, _, _)| *key == name)
         .ok_or_else(|| format!("Unknown guide '{name}'; use ocs_read op guide without parameters.name to list guides"))?;
     Ok(
@@ -2434,7 +2435,7 @@ fn execute_output_schema() -> Value {
 }
 
 pub(crate) fn tool_definitions() -> Value {
-    json!([
+    let mut definitions = json!([
         {
             "name":"ocs_sessions",
             "description":"List real OpenCADStudio GUI sessions and documents. Launch the installed editor if none is running. On first use, announce the build to the user from the `bridge` object in each result (OpenCADStudio version, build_rev, tool_schema digest); announce again if a later call reports a different build.",
@@ -2483,7 +2484,14 @@ pub(crate) fn tool_definitions() -> Value {
             },
             "title":"Capture OCS window","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}
         }
-    ])
+    ]);
+    let read = definitions.as_array_mut().unwrap().iter_mut()
+        .find(|tool| tool["name"] == "ocs_read").expect("read tool is defined");
+    read["description"] = json!(format!("{} Native recognize reads live model-space structure, source handles, topology and review items without exports. Use layers and tolerance to select candidate centerlines; every collection has independent offset/limit paging.", read["description"].as_str().unwrap_or_default()));
+    let properties = &mut read["inputSchema"]["properties"]["parameters"]["properties"];
+    properties["layers"] = json!({"type":"array","items":{"type":"string"},"description":"Case-insensitive native recognition layer filters; omit for all candidate geometry."});
+    properties["tolerance"] = json!({"type":"number","minimum":1e-9,"description":"Native recognition endpoint tolerance in drawing units (default 1). Result limit is capped at 1000 per collection."});
+    definitions
 }
 
 fn tool_result(value: Value) -> Value {
@@ -3206,6 +3214,12 @@ mod tests {
         };
         let run_var = find_variant("run");
         assert_eq!(run_var["properties"]["cmd"]["type"], "string");
+        assert!(READ_OPS.contains(&"commands"));
+        crate::schema_validation::validate_shape(read_schema, &json!({
+            "ocs_session_id":"test", "op":"recognize",
+            "parameters":{"layers":["PIPES"],"tolerance":0.01,"offset":0,"limit":200}
+        }), "").unwrap();
+        assert!(EXECUTE_OPS.contains(&"run"));
         assert!(READ_OPS.contains(&"capabilities"));
         assert!(READ_OPS.contains(&"records"));
         assert!(READ_OPS.contains(&"record_schema"));

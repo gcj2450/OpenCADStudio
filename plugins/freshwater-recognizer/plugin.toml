@@ -1,0 +1,14 @@
+[plugin]
+id = "cadagent.freshwater"
+name = "Fresh Water Recognition"
+version = "0.2.0"
+description = "Fresh-water recognition with refreshable CADAGENT_RECOGNITION overlay"
+license = "GPL-3.0-only"
+
+[opencad]
+api_version = 10
+rustc_version = "rustc 1.98.1 (48a229cea 2026-09-01)"
+acadrust_source = "git+https://github.com/HakanSeven12/opencadcodec.git?rev=cb3ce6a#cb3ce6a93c76a5069f5c2391ee44ea38b4485d15"
+ribbon_order = 60
+command_prefixes = ["FW_"]
+xdata_apps = []

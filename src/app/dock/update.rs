@@ -499,6 +499,7 @@ impl OpenCADStudio {
                         self.sync_ribbon_layers();
                         self.show_layers = true;
                     }
+                    PanelId::Agent => self.show_agent_panel = true,
                 }
             }
             self.dock_reveal(id);
@@ -539,6 +540,7 @@ impl OpenCADStudio {
                 self.graphic_attributes.close_popups();
                 self.save_config();
             }
+            PanelId::Agent => self.show_agent_panel = false,
         }
         self.dock_unpeek(id);
         // A closed pallet cannot stay held by the pointer.
@@ -616,6 +618,7 @@ impl OpenCADStudio {
             PanelId::SheetSetManager => self.sheet_set.show,
             PanelId::Layers => self.show_layers,
             PanelId::GraphicAttributes => self.show_graphic_attributes,
+            PanelId::Agent => self.show_agent_panel,
         }
     }
 

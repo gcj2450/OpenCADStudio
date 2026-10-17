@@ -1065,6 +1065,20 @@ pub(crate) fn load_file_with_progress(
     finalize_loaded_outcome(path, outcome)
 }
 
+/// Load a drawing by path and apply the same finalization and corruption
+/// cleanup used by automation's open operation. DWG callers retain the mmap
+/// fast path in [`read_dwg_path`].
+#[cfg(not(target_arch = "wasm32"))]
+pub fn load_path_finalized(path: &Path) -> Result<(CadDocument, usize), String> {
+    let outcome = read_file_attempt(path, None, false).map_err(|failure| failure.message)?;
+    if !outcome.stats.has_usable_drawing_data() {
+        return Err("initial read returned no source drawing records".to_string());
+    }
+    let mut outcome = finalize_loaded_outcome(path, outcome)?;
+    let dropped = purge_corrupt_entities(&mut outcome.document);
+    Ok((outcome.document, dropped))
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 fn load_file_for_open(
     path: &Path,

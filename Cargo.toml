@@ -11,6 +11,7 @@ members = [
     "crates/ocs_plugin_api",
     "crates/ocs_save",
     "crates/ocs_web_worker",
+    "crates/ocs_recognition",
     "crates/dwg-thumbnailer",
     "crates/dwg-thumbnailer-win",
 ]
@@ -45,6 +46,7 @@ dwg-thumbnailer = { path = "crates/dwg-thumbnailer" }
 # Shared SAVE serialization dispatch + web-worker wire format: one
 # implementation for the inline (fallback/native) path and the worker path.
 ocs_save = { path = "crates/ocs_save" }
+ocs_recognition = { path = "crates/ocs_recognition" }
 flate2 = "1"
 # Raster decode set: png/jpeg/bmp/tiff plus webp/gif (both pure-Rust in
 # image 0.25, so the wasm target stays C-free). Every format named here must
@@ -111,6 +113,8 @@ objc2-foundation = { version = "0.2", features = ["NSArray", "NSURL", "NSString"
 [patch.crates-io]
 iced_core = { git = "https://github.com/iced-rs/iced.git", rev = "23604ff22ab0aad9e00b9327cb7b8546ed84db39" }
 iced_widget = { git = "https://github.com/iced-rs/iced.git", rev = "23604ff22ab0aad9e00b9327cb7b8546ed84db39" }
+tokio-tungstenite = { git = "https://github.com/openai-oss-forks/tokio-tungstenite", rev = "0e5b2d73aa18dd9f0a50ee9ff199d5aef7594186" }
+tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev = "4fffad30fe373adbdcffab9545e9e9bf4f2fc19f" }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 getrandom = "0.3"
@@ -121,6 +125,9 @@ i18n-embed = { version = "0.16", features = ["desktop-requester"] }
 rayon = "1"
 open = "5"
 ureq = { version = "3", default-features = false, features = ["rustls", "platform-verifier", "win-system-proxy"] }
+codex-app-server-client = { path = "../codex/codex-rs/app-server-client" }
+codex-app-server-protocol = { path = "../codex/codex-rs/app-server-protocol" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 ocs_plugin_api = { path = "crates/ocs_plugin_api" }

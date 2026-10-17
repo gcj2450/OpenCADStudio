@@ -138,8 +138,6 @@ pub struct Cli {
 pub struct GuiConfig {
     /// Files to open on launch (empty for a blank session).
     pub files: Vec<PathBuf>,
-    /// Open a fresh drawing tab on launch instead of the welcome screen.
-    pub new: bool,
     /// Saving disabled for this session.
     pub read_only: bool,
     /// Force storage-buffer-free wire and hatch pipelines.

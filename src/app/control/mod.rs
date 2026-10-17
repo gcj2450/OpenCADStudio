@@ -528,7 +528,7 @@ impl OpenCADStudio {
             "mtext_editor":self.mtext_editor.as_ref().map(|e|json!({"text":e.content.text(),"height":e.height,"style":e.style})),
             "text_editor":self.text_inline.is_some(),"event_cursor":self.control.serial,
             "operation":self.control.pending.as_ref().map(|p| &p.id),
-            "capabilities":["commands","command_manifest","step_input","batch","compact_results","entity_pick","structure_pick","selection","user_select","properties","records","record_schemas","record_filters","atomic_record_updates","layers","history","documents","events","capture","viewport_capture","measure","spatial_query","audit","verified_save","explicit_save_version"]
+            "capabilities":["commands","command_manifest","step_input","batch","compact_results","entity_pick","structure_pick","selection","user_select","properties","records","record_schemas","record_filters","atomic_record_updates","native_recognition","layers","history","documents","events","capture","viewport_capture","measure","spatial_query","audit","verified_save","explicit_save_version"]
         })
     }
 
@@ -563,6 +563,7 @@ impl OpenCADStudio {
                 | "capabilities"
                 | "tools"
                 | "entities"
+                | "recognize"
                 | "layers"
                 | "header"
                 | "history"

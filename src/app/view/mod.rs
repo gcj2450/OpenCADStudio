@@ -3031,6 +3031,12 @@ impl OpenCADStudio {
         #[cfg(target_arch = "wasm32")]
         let control = iced::time::every(std::time::Duration::from_millis(50))
             .map(|_| Message::PollWebControl);
+        #[cfg(not(target_arch = "wasm32"))]
+        let agent_tools = if self.agent.pending_tools.is_empty() {
+            Subscription::none()
+        } else {
+            iced::time::every(std::time::Duration::from_millis(150)).map(|_| Message::AgentToolPoll)
+        };
         iced::Subscription::batch([
             if self.spacemouse.moving() && self.spacemouse_focused && !self.spacemouse_paused {
                 window::frames().map(Message::SpaceMouseFrame)
@@ -3052,6 +3058,8 @@ impl OpenCADStudio {
                 _ => None,
             }),
             control,
+            #[cfg(not(target_arch = "wasm32"))]
+            agent_tools,
             frames,
             history_tick,
             layout_settle,

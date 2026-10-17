@@ -36,6 +36,7 @@
 use std::f64::consts::{PI, TAU};
 use std::hint::black_box;
 use std::io::Cursor;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -708,6 +709,70 @@ fn bench_dxf_io_throughput(runner: &mut BenchmarkRunner) {
 
 // ── 8. Selection State Deep vs Arc Cloning ───────────────────────────────────
 // Incorporates the existing `bench_selection_state_clone`
+
+fn bench_dwg_open_path_vs_snapshot(runner: &mut BenchmarkRunner) {
+    if !runner.should_run("dwg_open") && !runner.should_run("dwg") {
+        return;
+    }
+    let Some(path) = std::env::var_os("CAD_BENCH_DWG").map(PathBuf::from) else {
+        return;
+    };
+    let file_size = std::fs::metadata(&path).expect("stat benchmark DWG").len() as f64;
+    let runs = if runner.quick_mode { 3 } else { 8 };
+    let mut path_samples = Vec::with_capacity(runs);
+    let mut snapshot_samples = Vec::with_capacity(runs);
+    let mut expected_entities = None;
+
+    // Alternate the order to avoid always warming the file cache for one reader.
+    // These are repeated opens; the benchmark does not claim an OS cold cache.
+    for iteration in 0..runs {
+        for use_path in if iteration % 2 == 0 {
+            [true, false]
+        } else {
+            [false, true]
+        } {
+            let started = Instant::now();
+            let (document, _) = if use_path {
+                OpenCADStudio::io::load_path_finalized(&path).expect("path reader")
+            } else {
+                let bytes = std::fs::read(&path).expect("snapshot read");
+                OpenCADStudio::io::load_bytes_finalized(&path, bytes).expect("snapshot reader")
+            };
+            let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+            if use_path {
+                path_samples.push(elapsed);
+            } else {
+                snapshot_samples.push(elapsed);
+            }
+            let count = document.entities().count();
+            assert_eq!(expected_entities.replace(count).unwrap_or(count), count);
+            black_box(document);
+        }
+    }
+    for (name, description, mut samples) in [
+        (
+            "dwg_open_path_reader",
+            "DWG path open with native finalization and mmap fast path",
+            path_samples,
+        ),
+        (
+            "dwg_open_snapshot_reader",
+            "DWG byte snapshot open with legacy finalization",
+            snapshot_samples,
+        ),
+    ] {
+        samples.sort_by(f64::total_cmp);
+        let seconds = samples[samples.len() / 2] / 1000.0;
+        runner.record(
+            name,
+            description,
+            "ms",
+            samples,
+            Some((file_size / (1024.0 * 1024.0) / seconds, "MB/s")),
+            None,
+        );
+    }
+}
 
 fn bench_selection_cloning(runner: &mut BenchmarkRunner) {
     if !runner.should_run("selection") && !runner.should_run("clone") {
@@ -2264,6 +2329,7 @@ fn main() {
     bench_osnap_evaluation(&mut runner);
     bench_geometric_constraint_solving(&mut runner);
     bench_dxf_io_throughput(&mut runner);
+    bench_dwg_open_path_vs_snapshot(&mut runner);
     bench_selection_cloning(&mut runner);
     bench_ui_ribbon_view_construction(&mut runner);
     bench_ui_grid_geometry(&mut runner);

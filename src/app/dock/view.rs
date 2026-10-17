@@ -450,6 +450,27 @@ impl OpenCADStudio {
             crate::ui::dock::PanelId::Layers => {
                 tab.layers.view_panel(self.layer_name_col_w, width, chrome)
             }
+            crate::ui::dock::PanelId::Agent => {
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    self.agent.view(width, chrome)
+                }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    let title = crate::ui::dock::title_bar(
+                        crate::ui::dock::PanelId::Agent,
+                        "CAD Agent".to_string(),
+                        chrome,
+                    );
+                    crate::ui::dock::frame(
+                        title,
+                        iced::widget::text(
+                            "The embedded CAD agent is available in the desktop application.",
+                        ),
+                        width,
+                    )
+                }
+            }
         }
     }
 

@@ -1,3 +1,5 @@
+#[cfg(not(target_arch = "wasm32"))]
+mod agent;
 mod alias;
 mod automation;
 pub(crate) mod control;
@@ -498,6 +500,9 @@ pub(super) struct OpenCADStudio {
     recent_limit_input: String,
     recent_view: RecentView,
     command_line: CommandLine,
+    show_agent_panel: bool,
+    #[cfg(not(target_arch = "wasm32"))]
+    agent: agent::AgentPanelState,
     /// Recent Patreon supporters shown on the Start page (name, USD cents),
     /// fetched once at boot, highest payment first.
     patrons: Vec<(String, i64)>,
@@ -2489,6 +2494,48 @@ pub enum Message {
         redrew: bool,
     },
     ControlToggle,
+    #[cfg(not(target_arch = "wasm32"))]
+    AgentInput(String),
+    #[cfg(not(target_arch = "wasm32"))]
+    AgentTranscriptAction(usize, iced::widget::text_editor::Action),
+    #[cfg(not(target_arch = "wasm32"))]
+    AgentQuickPrompt(String),
+    #[cfg(not(target_arch = "wasm32"))]
+    AgentSend,
+    #[cfg(not(target_arch = "wasm32"))]
+    AgentStop,
+    #[cfg(not(target_arch = "wasm32"))]
+    AgentToggleHistory,
+    #[cfg(not(target_arch = "wasm32"))]
+    AgentToggleSettings,
+    #[cfg(not(target_arch = "wasm32"))]
+    #[allow(private_interfaces)]
+    AgentAccount(agent::AgentAccountAction),
+    #[cfg(not(target_arch = "wasm32"))]
+    #[allow(private_interfaces)]
+    AgentApiKeyInput(agent::AgentSecret),
+    #[cfg(not(target_arch = "wasm32"))]
+    #[allow(private_interfaces)]
+    AgentQuestionInput(serde_json::Value, usize, agent::AgentSecret),
+    #[cfg(not(target_arch = "wasm32"))]
+    AgentSubmitAnswers(serde_json::Value, bool),
+    #[cfg(not(target_arch = "wasm32"))]
+    AgentNewConversation,
+    #[cfg(not(target_arch = "wasm32"))]
+    AgentResumeConversation(String),
+    #[cfg(not(target_arch = "wasm32"))]
+    AgentResolveApproval(usize, bool),
+    #[cfg(not(target_arch = "wasm32"))]
+    AgentModelInput(String),
+    #[cfg(not(target_arch = "wasm32"))]
+    AgentChooseModel(String),
+    #[cfg(not(target_arch = "wasm32"))]
+    AgentSetEffort(String),
+    #[cfg(not(target_arch = "wasm32"))]
+    #[allow(private_interfaces)]
+    AgentEvent(Option<agent::AgentEvent>),
+    #[cfg(not(target_arch = "wasm32"))]
+    AgentToolPoll,
     /// Node graph overlay interaction.
     Graph(crate::ui::node_graph::GraphMsg),
     Tick(Instant),
@@ -4679,6 +4726,9 @@ impl OpenCADStudio {
             recent_limit_input: recent::RECENT_DEFAULT.to_string(),
             recent_view: RecentView::default(),
             command_line: CommandLine::new(),
+            show_agent_panel: false,
+            #[cfg(not(target_arch = "wasm32"))]
+            agent: agent::AgentPanelState::default(),
             patrons: Vec::new(),
             videos: Vec::new(),
             video_thumbs: std::collections::HashMap::new(),
@@ -5312,6 +5362,25 @@ impl OpenCADStudio {
         app
     }
 
+    /// Replace the legacy welcome tab with the first editable drawing.
+    ///
+    /// The start-page view remains in the renderer for backwards-compatible
+    /// sessions and tests, but it is never the first surface shown by the
+    /// desktop editor.  Keeping this transition in one method also makes it
+    /// impossible for the command line, dock layout or agent panel to inherit
+    /// the dummy scene used by the welcome page.
+    fn enter_drawing_workspace(&mut self) {
+        if self.tabs.len() == 1 && self.tabs[0].is_start {
+            self.tab_counter = self.tab_counter.max(1);
+            self.tabs[0] = document::DocumentTab::new_drawing(self.tab_counter);
+            self.active_tab = 0;
+            self.apply_display_defaults(0);
+            self.sync_ribbon_layers();
+            self.sync_ribbon_styles();
+            self.sync_ribbon_from_selection();
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn new_for_test() -> Self {
         let mut app = Self::new();
@@ -5383,6 +5452,14 @@ impl OpenCADStudio {
             ..Default::default()
         });
         let mut s = state;
+        // Open the editor directly into a real drawing workspace.  The former
+        // welcome tab was useful for the website, but it adds a full page
+        // render and several network-backed tasks before a CAD file can be
+        // opened.  Keep the start-page renderer available for old sessions,
+        // while making the native application start on an empty drawing.
+        s.enter_drawing_workspace();
+        s.show_agent_panel = true;
+        s.dock_open_at_default(crate::ui::dock::PanelId::Agent);
         s.main_window = Some(id);
         let open_main = open_task.map(|_| Message::Noop);
         let check_update = Task::perform(
@@ -5397,7 +5474,8 @@ impl OpenCADStudio {
         // skips one already open, and queues the rest behind the load in
         // flight. Handing them straight to `OpenRecent` would let each
         // overwrite the single `opening` slot and silently drop all but one.
-        // `--new` opens a fresh drawing tab instead of the welcome screen.
+        // The editor has already replaced the welcome tab with its one blank
+        // startup drawing, so file and script startup do not create another.
         // `--read-only` disables saving. `--script` queues command lines.
         let cfg = crate::cli::gui_config();
         s.read_only = cfg.read_only;
@@ -5419,14 +5497,12 @@ impl OpenCADStudio {
                     .into_iter()
                     .map(|p| Task::done(Message::OpenExternal(p))),
             )
-        } else if cfg.new || !cfg.script_lines.is_empty() {
-            Task::done(Message::TabNew)
         } else {
             Task::none()
         };
         // Startup command script: if files were passed to open, defer the
         // script lines until the document finishes opening. Otherwise, dispatch
-        // them on the newly created drawing tab.
+        // them on the startup drawing tab.
         let script: Task<Message> = if cfg.script_lines.is_empty() {
             Task::none()
         } else if has_files {
@@ -5440,73 +5516,12 @@ impl OpenCADStudio {
             )
         };
         s.queue_startup_prompts();
-        // Fetch the Patreon supporters list once at boot for the Start page.
-        #[cfg(not(target_arch = "wasm32"))]
-        let patrons_fetch = Task::perform(
-            async { crate::patreon::fetch_patrons() },
-            Message::PatronsFetched,
-        );
-        #[cfg(target_arch = "wasm32")]
-        let patrons_fetch = Task::none();
-        // Tutorial videos: show the on-disk cache instantly, refresh from the
-        // live playlist in the background. Nothing ships in the binary. The
-        // fetch runs on its own OS thread — its several sequential HTTP
-        // requests would otherwise sit on the async executor and hold up the
-        // rest of the boot tasks (the Start page waited on it).
-        #[cfg(not(target_arch = "wasm32"))]
-        let videos_fetch = {
-            s.set_videos(crate::videos::load_cached());
-            s.videos_loading = true;
-            let (tx, rx) = iced::futures::channel::oneshot::channel();
-            std::thread::spawn(move || {
-                let _ = tx.send(crate::videos::fetch_playlist());
-            });
-            Task::perform(
-                async move {
-                    rx.await
-                        .unwrap_or_else(|_| Err("video fetch thread died".into()))
-                },
-                Message::VideosFetched,
-            )
-        };
-        #[cfg(target_arch = "wasm32")]
-        let videos_fetch = Task::none();
-        // GitHub Discussions: seed from the last successful fetch, then refresh
-        // the public feed and pinned section on a background thread.
-        #[cfg(not(target_arch = "wasm32"))]
-        let discussions_fetch = {
-            s.discussions = crate::discussions::load_cached();
-            s.discussions_loading = true;
-            let (tx, rx) = iced::futures::channel::oneshot::channel();
-            std::thread::spawn(move || {
-                let _ = tx.send(crate::discussions::fetch_discussions());
-            });
-            Task::perform(
-                async move {
-                    rx.await
-                        .unwrap_or_else(|_| Err("discussion fetch thread died".into()))
-                },
-                Message::DiscussionsFetched,
-            )
-        };
-        #[cfg(target_arch = "wasm32")]
-        let discussions_fetch = Task::none();
-        // Recent-file thumbnails: decoded off-thread — parsing every recent
-        // DWG's preview on the boot path held the first frame back.
-        let thumbs_fetch = s.refresh_recent_thumbs();
+        // Start-up is intentionally local and deterministic.  Welcome-page
+        // supporters, video, discussion and thumbnail fetches are no longer
+        // part of the editor boot path; CAD loading owns the first frame.
         (
             s,
-            Task::batch([
-                open_main,
-                check_update,
-                focus_cmd,
-                cli_open,
-                script,
-                patrons_fetch,
-                videos_fetch,
-                discussions_fetch,
-                thumbs_fetch,
-            ]),
+            Task::batch([open_main, check_update, focus_cmd, cli_open, script]),
         )
     }
 
@@ -5517,6 +5532,7 @@ impl OpenCADStudio {
     fn boot_web() -> (Self, Task<Message>) {
         #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
         let mut s = Self::new();
+        s.enter_drawing_workspace();
         // A web host that intends to automate can opt in before the first
         // control request by setting `opencadstudio.automation` to "1" in
         // localStorage (the same pre-load mechanism the settings use): the
@@ -5536,17 +5552,6 @@ impl OpenCADStudio {
             Task::done(Message::PollWebFonts),
             Task::done(Message::ApplyWebFont(primary_font)),
         ]);
-        // Web can't reach the Patreon API directly (CORS); fetch the CI-built
-        // supporters.json served on the same origin instead.
-        let patrons = Task::perform(crate::patreon::fetch_patrons_web(), Message::PatronsFetched);
-        s.videos_loading = true;
-        let videos = Task::perform(crate::videos::fetch_playlist_web(), Message::VideosFetched);
-        s.discussions_loading = true;
-        let discussions = Task::perform(
-            crate::discussions::fetch_discussions_web(),
-            Message::DiscussionsFetched,
-        );
-        let thumbs_fetch = s.refresh_recent_thumbs();
         // Crash-recovery scan: OPFS snapshots newer than a drawing's last
         // saved copy come back as a restore prompt (stale ones are deleted).
         let autosave_scan = Task::perform(
@@ -5593,19 +5598,7 @@ impl OpenCADStudio {
                 crate::io::web_link::ParsedLink::Absent => Task::none(),
             }
         };
-        (
-            s,
-            Task::batch([
-                focus,
-                fonts,
-                patrons,
-                videos,
-                discussions,
-                thumbs_fetch,
-                autosave_scan,
-                deep_link,
-            ]),
-        )
+        (s, Task::batch([focus, fonts, autosave_scan, deep_link]))
     }
 }
 

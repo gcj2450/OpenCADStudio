@@ -757,11 +757,14 @@ impl OpenCADStudio {
                     return err("open: missing \"path\"");
                 };
                 let path_buf = PathBuf::from(path);
-                let bytes = match self.read_drawing(&path_buf) {
-                    Ok(b) => b,
-                    Err(e) => return err(format!("open: {e}")),
+                let loaded = if self.tab_showing(&path_buf).is_some() {
+                    self.read_drawing(&path_buf)
+                        .map_err(|error| error.to_string())
+                        .and_then(|bytes| crate::io::load_bytes_finalized(&path_buf, bytes))
+                } else {
+                    crate::io::load_path_finalized(&path_buf)
                 };
-                match crate::io::load_bytes_finalized(&path_buf, bytes) {
+                match loaded {
                     Ok((doc, dropped)) => {
                         let i = self.active_tab;
                         self.tabs[i].scene.clear();
@@ -850,6 +853,22 @@ impl OpenCADStudio {
                 })
             }
             "entities" => self.entity_summary(),
+            "recognize" => {
+                let tolerance = req["tolerance"].as_f64().unwrap_or(1.0);
+                let layers = req["layers"].as_array().map(|v| v.iter().filter_map(Value::as_str).map(str::to_owned).collect())
+                    .unwrap_or_else(|| req["layer"].as_str().map(|l| vec![l.to_owned()]).unwrap_or_default());
+                let options = ocs_recognition::Options {
+                    tolerance, layers,
+                    offset: req["offset"].as_u64().unwrap_or(0).min(usize::MAX as u64) as usize,
+                    limit: req["limit"].as_u64().unwrap_or(200).clamp(1, 1000) as usize,
+                };
+                let tab = &self.tabs[self.active_tab];
+                let mut result = ocs_recognition::recognize(&tab.scene.document, &options);
+                result["document_id"] = json!(tab.id);
+                result["revision"] = json!(tab.edit_revision);
+                result["geometry_revision"] = json!(tab.scene.geometry_epoch);
+                result
+            }
             "audit" => self.document_audit(&req),
             "query" => self.entity_query(&req),
             "text_search" => self.automation_text_search(&req),
@@ -1724,6 +1743,33 @@ impl OpenCADStudio {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_recognition_reads_current_geometry_without_editing_it() {
+        let mut app = super::OpenCADStudio::new_for_test();
+        app.automation_op(r#"{"op":"new"}"#);
+        app.automation_op(r#"{"op":"run","cmd":"LINE 0,0 10,0"}"#);
+        let tab = app.active_tab;
+        let id = app.tabs[tab].id;
+        let revision = app.tabs[tab].edit_revision;
+        let epoch = app.tabs[tab].scene.geometry_epoch;
+        let count = app.tabs[tab].scene.document.entities().count();
+        let result = app.automation_op(r#"{"op":"recognize","layers":["0"],"tolerance":0.01}"#);
+        assert_eq!(result["ok"], true, "{result}");
+        assert_eq!(result["engine"], "native");
+        assert_eq!(result["document_id"], id);
+        assert_eq!(result["revision"], revision);
+        assert_eq!(result["geometry_revision"], epoch);
+        assert_eq!(result["steps"].as_array().unwrap().len(), 1);
+        assert_eq!(app.tabs[tab].edit_revision, revision);
+        assert_eq!(app.tabs[tab].scene.geometry_epoch, epoch);
+        assert_eq!(app.tabs[tab].scene.document.entities().count(), count);
+        app.automation_op(r#"{"op":"run","cmd":"LINE 100,0 110,0"}"#);
+        let updated = app.automation_op(r#"{"op":"recognize","tolerance":0.01}"#);
+        assert_eq!(updated["steps"].as_array().unwrap().len(), 2);
+        assert_ne!(updated["revision"], result["revision"]);
+        assert_eq!(app.automation_op(r#"{"op":"recognize","tolerance":0}"#)["ok"], false);
+    }
+
     #[test]
     fn clayer_command_sets_layer_used_by_new_geometry() {
         let mut app = super::OpenCADStudio::new_for_test();
@@ -3836,6 +3882,35 @@ mod tests {
         ));
         let _ = std::fs::remove_file(sidecar);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn open_dwg_uses_the_path_reader_and_loads_entities() {
+        let mut doc = codec::CadDocument::new();
+        let mut circle = codec::entities::Circle::new();
+        circle.center = codec::types::Vector3::new(12.0, 34.0, 0.0);
+        circle.radius = 5.0;
+        doc.add_entity(codec::EntityType::Circle(circle)).unwrap();
+        let bytes = crate::io::save_to_bytes(&doc, "dwg", doc.version).expect("write DWG");
+        let path = std::env::temp_dir().join(format!(
+            "ocs_automation_path_open_{}.dwg",
+            std::process::id()
+        ));
+        std::fs::write(&path, bytes).unwrap();
+
+        let mut app = OpenCADStudio::new_for_test();
+        let escaped_path = path.to_string_lossy().replace('\\', "\\\\");
+        let result = app.automation_op(&format!(r#"{{"op":"open","path":"{escaped_path}"}}"#));
+        assert_eq!(result["ok"], true, "{}", result["error"]);
+        assert_eq!(result["total"], 1);
+
+        drop(app);
+        let sidecar = path.with_file_name(format!(
+            ".{}.ocs.lock",
+            path.file_name().unwrap().to_string_lossy()
+        ));
+        let _ = std::fs::remove_file(sidecar);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

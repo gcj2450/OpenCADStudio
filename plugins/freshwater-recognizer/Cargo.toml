@@ -1,0 +1,20 @@
+[package]
+name = "ocs-freshwater-recognizer"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "cad-reader"
+path = "src/main.rs"
+
+[dependencies]
+ocs_plugin_api = { path = "../../crates/ocs_plugin_api", features = ["host"] }
+serde_json = "1"
+ocs_recognition = { path = "../../crates/ocs_recognition" }
+

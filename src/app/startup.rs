@@ -12,6 +12,7 @@ impl OpenCADStudio {
         // web host opted in at boot) while control is enabled, the donation
         // prompt is suppressed — a modal would block every automated
         // operation until a client closed it by hand.
+        #[cfg(target_arch = "wasm32")]
         if self.donation_prompt_version != env!("OCS_APP_VERSION")
             && !(self.control.enabled && self.control.automation_seen)
         {
@@ -150,8 +151,21 @@ pub(crate) fn gpu_platform_hint() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::{config::AppConfig, Message};
+    use crate::app::Message;
     use iced::wgpu;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn native_startup_never_queues_donation_even_with_old_settings() {
+        for version in ["", "previous-release", env!("OCS_APP_VERSION")] {
+            let mut app = OpenCADStudio::new_for_test();
+            app.default_assoc_prompted = true;
+            app.donation_prompt_version = version.to_string();
+            app.queue_startup_prompts();
+            assert_ne!(app.active_modal, Some(ModalKind::DonationPrompt));
+            assert!(!app.pending_startup_modals.contains(&ModalKind::DonationPrompt));
+        }
+    }
 
     #[test]
     fn the_software_warning_names_the_adapter_and_every_platform_has_a_hint() {
@@ -199,6 +213,7 @@ mod tests {
         assert_ne!(software.identity().unwrap(), restarted.gpu_warning_silenced);
     }
 
+    #[cfg(target_arch = "wasm32")]
     #[test]
     fn donation_prompt_persists_once_per_version() {
         let mut app = OpenCADStudio::new_for_test();
@@ -232,6 +247,7 @@ mod tests {
         assert!(restarted.active_modal.is_none());
     }
 
+    #[cfg(target_arch = "wasm32")]
     #[test]
     fn automation_sessions_skip_the_donation_prompt() {
         // First control contact drops a still-queued donation prompt and
@@ -268,6 +284,7 @@ mod tests {
         assert_eq!(human.active_modal, Some(ModalKind::DonationPrompt));
     }
 
+    #[cfg(target_arch = "wasm32")]
     #[test]
     fn startup_dialogs_wait_their_turn_and_preserve_unseen_prompts() {
         let mut app = OpenCADStudio::new_for_test();

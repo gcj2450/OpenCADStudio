@@ -121,11 +121,13 @@ pub enum PanelId {
     SheetSetManager,
     /// The Layer Manager (LAYERS).
     Layers,
+    /// Native Codex CAD assistant.
+    Agent,
 }
 
 impl PanelId {
     /// Every panel, in the order the pallet menu lists them.
-    pub const ALL: [PanelId; 11] = [
+    pub const ALL: [PanelId; 12] = [
         PanelId::Properties,
         PanelId::GraphicAttributes,
         PanelId::BlockPalette,
@@ -137,6 +139,7 @@ impl PanelId {
         PanelId::Count,
         PanelId::SheetSetManager,
         PanelId::Layers,
+        PanelId::Agent,
     ];
 
     /// Localized-friendly display name used by the collapsed/edge chrome.
@@ -153,6 +156,7 @@ impl PanelId {
             PanelId::Count => "Count",
             PanelId::SheetSetManager => "Sheet Set Manager",
             PanelId::Layers => "Layer Manager",
+            PanelId::Agent => "CAD Agent",
         }
     }
 
@@ -172,6 +176,7 @@ impl PanelId {
             PanelId::Count => include_bytes!("../../assets/icons/data_extract.svg"),
             PanelId::SheetSetManager => include_bytes!("../../assets/icons/sheetset.svg"),
             PanelId::Layers => include_bytes!("../../assets/icons/layers/panel.svg"),
+            PanelId::Agent => include_bytes!("../../assets/icons/ui/agent.svg"),
         }
     }
 
@@ -189,6 +194,7 @@ impl PanelId {
             PanelId::Count => 280.0,
             PanelId::SheetSetManager => 280.0,
             PanelId::Layers => 560.0,
+            PanelId::Agent => 380.0,
         }
     }
 
@@ -293,17 +299,37 @@ impl DockGroup {
 
 /// On-disk forms of one entry of an edge list. Configs from before groups
 /// stored each stacked pallet as a bare id.
-#[derive(Deserialize)]
-#[serde(untagged)]
 enum GroupRepr {
     Single(PanelId),
     Stack {
         panels: Vec<PanelId>,
-        #[serde(default)]
         weights: Vec<f32>,
-        #[serde(default)]
         width: f32,
     },
+}
+
+impl<'de> Deserialize<'de> for GroupRepr {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        // Codex enables serde_json arbitrary_precision. Buffering an untagged
+        // enum through serde Content cannot decode its number representation
+        // as f32; deserialize each concrete JSON form directly instead.
+        let value = serde_json::Value::deserialize(de)?;
+        if value.is_string() {
+            return serde_json::from_value(value).map(Self::Single)
+                .map_err(serde::de::Error::custom);
+        }
+        #[derive(Deserialize)]
+        struct Stack {
+            panels: Vec<PanelId>,
+            #[serde(default)]
+            weights: Vec<f32>,
+            #[serde(default)]
+            width: f32,
+        }
+        let Stack { panels, weights, width } = serde_json::from_value::<Stack>(value)
+            .map_err(serde::de::Error::custom)?;
+        Ok(Self::Stack { panels, weights, width })
+    }
 }
 
 /// Read an edge list. Bare ids were pallets stacked on the edge, all shown

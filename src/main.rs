@@ -208,7 +208,6 @@ fn main() -> iced::Result {
         let gpu_compat_auto = !args.compat_renderer && !saved_compat && gpu.compat_renderer;
         let _ = cli::GUI_CONFIG.set(cli::GuiConfig {
             files: if args.new { Vec::new() } else { args.files },
-            new: args.new,
             read_only: args.read_only,
             compat_renderer,
             script_lines,

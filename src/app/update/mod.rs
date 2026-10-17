@@ -964,6 +964,66 @@ impl OpenCADStudio {
                 self.control.enabled = !self.control.enabled;
                 Task::none()
             }
+            #[cfg(not(target_arch = "wasm32"))]
+            Message::AgentInput(value) => {
+                self.agent.input = value;
+                Task::none()
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            Message::AgentTranscriptAction(index, action) => {
+                self.agent.apply_transcript_action(index, action);
+                Task::none()
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            Message::AgentQuickPrompt(prompt) => self.agent_quick_prompt(prompt),
+            #[cfg(not(target_arch = "wasm32"))]
+            Message::AgentSend => self.send_agent_prompt(),
+            #[cfg(not(target_arch = "wasm32"))]
+            Message::AgentStop => self.stop_agent_turn(),
+            #[cfg(not(target_arch = "wasm32"))]
+            Message::AgentToggleHistory => self.toggle_agent_history(),
+            #[cfg(not(target_arch = "wasm32"))]
+            Message::AgentToggleSettings => self.toggle_agent_settings(),
+            #[cfg(not(target_arch = "wasm32"))]
+            Message::AgentAccount(action) => self.agent_account_action(action),
+            #[cfg(not(target_arch = "wasm32"))]
+            Message::AgentQuestionInput(id, index, answer) => {
+                self.agent_question_input(id, index, answer)
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            Message::AgentSubmitAnswers(id, skip) => self.submit_agent_answers(id, skip),
+            #[cfg(not(target_arch = "wasm32"))]
+            Message::AgentApiKeyInput(value) => {
+                self.agent.api_key_input = value;
+                Task::none()
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            Message::AgentNewConversation => self.new_agent_conversation(),
+            #[cfg(not(target_arch = "wasm32"))]
+            Message::AgentResumeConversation(id) => self.resume_agent_conversation(id),
+            #[cfg(not(target_arch = "wasm32"))]
+            Message::AgentResolveApproval(index, approve) => {
+                self.resolve_agent_approval(index, approve)
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            Message::AgentModelInput(value) => {
+                self.agent.model_input = value;
+                Task::none()
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            Message::AgentChooseModel(model) => {
+                self.agent.model_input = model;
+                Task::none()
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            Message::AgentSetEffort(effort) => {
+                self.agent.selected_effort = effort;
+                Task::none()
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            Message::AgentEvent(event) => self.on_agent_event(event),
+            #[cfg(not(target_arch = "wasm32"))]
+            Message::AgentToolPoll => self.poll_agent_tools(),
             // Drain plugin-to-host requests that arrived outside of a host call.
             // This runs on a periodic timer so long-lived plugin sessions such
             // as the Python REPL can mutate the document without requiring a

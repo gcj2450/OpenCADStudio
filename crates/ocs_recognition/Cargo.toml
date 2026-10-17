@@ -1,0 +1,11 @@
+[package]
+name = "ocs_recognition"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+description = "Bounded recognition of live OpenCADStudio drawing structures"
+
+[dependencies]
+codec = { package = "opencadcodec", git = "https://github.com/HakanSeven12/opencadcodec.git", rev = "cb3ce6a", features = ["serde"] }
+serde_json = "1"
+
