@@ -1,0 +1,583 @@
+//! DXF code page ($DWGCODEPAGE) to encoding mapping.
+//!
+//! Exact legacy encodings, including OEM pages and Johab outside WHATWG.
+
+use encoding_rs::Encoding;
+use std::borrow::Cow;
+
+mod johab;
+
+/// A stateless encoding used by pre-Unicode CAD strings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LegacyEncoding {
+    Whatwg(&'static Encoding),
+    Oem(u16),
+    Johab,
+}
+
+impl From<&'static Encoding> for LegacyEncoding {
+    fn from(encoding: &'static Encoding) -> Self {
+        Self::Whatwg(encoding)
+    }
+}
+
+impl LegacyEncoding {
+    pub fn decode_without_bom_handling<'a>(self, bytes: &'a [u8]) -> (Cow<'a, str>, bool) {
+        if let Self::Whatwg(encoding) = self {
+            return encoding.decode_without_bom_handling(bytes);
+        }
+        let (text, _, errors) = self.decode(bytes);
+        (text, errors)
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Whatwg(encoding) => encoding.name(),
+            Self::Oem(437) => "CP437",
+            Self::Oem(850) => "CP850",
+            Self::Oem(852) => "CP852",
+            Self::Oem(855) => "CP855",
+            Self::Oem(857) => "CP857",
+            Self::Oem(860) => "CP860",
+            Self::Oem(861) => "CP861",
+            Self::Oem(863) => "CP863",
+            Self::Oem(864) => "CP864",
+            Self::Oem(865) => "CP865",
+            Self::Oem(869) => "CP869",
+            Self::Oem(_) => "OEM",
+            Self::Johab => "JOHAB",
+        }
+    }
+
+    pub fn decode<'a>(self, bytes: &'a [u8]) -> (Cow<'a, str>, Self, bool) {
+        match self {
+            Self::Whatwg(encoding) => {
+                let (text, _, errors) = encoding.decode(bytes);
+                (text, self, errors)
+            }
+            Self::Oem(page) => {
+                let table = oem_cp::code_table::DECODING_TABLE_CP_MAP.get(&page);
+                let mut errors = false;
+                // The OEM crate preserves a few undefined bytes as controls;
+                // CAD text follows the original Microsoft mapping instead.
+                let text = bytes
+                    .iter()
+                    .map(|&byte| {
+                        let ch = if page == 864 && byte == 0x25 {
+                            Some('\u{066A}')
+                        } else if page == 864 && matches!(byte, 0x9B..=0x9C | 0x9F)
+                            || page == 869 && matches!(byte, 0x80..=0x85 | 0x87 | 0x93..=0x94)
+                        {
+                            None
+                        } else {
+                            table.and_then(|table| table.decode_char_checked(byte))
+                        };
+                        ch.unwrap_or_else(|| {
+                            errors = true;
+                            '\u{FFFD}'
+                        })
+                    })
+                    .collect::<String>();
+                (Cow::Owned(text), self, errors)
+            }
+            Self::Johab => {
+                let (text, errors) = johab::decode(bytes);
+                (Cow::Owned(text), self, errors)
+            }
+        }
+    }
+
+    pub fn encode<'a>(self, text: &'a str) -> (Cow<'a, [u8]>, Self, bool) {
+        if let Self::Whatwg(encoding) = self {
+            let (bytes, _, errors) = encoding.encode(text);
+            return (bytes, self, errors);
+        }
+        let mut errors = false;
+        let mut bytes = Vec::with_capacity(text.len());
+        for ch in text.chars() {
+            match self {
+                Self::Oem(page) => {
+                    let byte = if page == 864 && ch == '\u{066A}' {
+                        Some(0x25)
+                    } else if page == 864 && (ch == '%' || matches!(ch as u32, 0x9B..=0x9C | 0x9F))
+                        || page == 869 && matches!(ch as u32, 0x80..=0x85 | 0x87 | 0x93..=0x94)
+                    {
+                        None
+                    } else if ch.is_ascii() {
+                        Some(ch as u8)
+                    } else {
+                        oem_cp::code_table::ENCODING_TABLE_CP_MAP
+                            .get(&page)
+                            .and_then(|table| table.get(&ch))
+                            .copied()
+                    };
+                    bytes.push(byte.unwrap_or_else(|| {
+                        errors = true;
+                        b'?'
+                    }));
+                }
+                Self::Johab => {
+                    if let Some(encoded) = johab::encode_char(ch) {
+                        bytes.extend_from_slice(&encoded.0[..encoded.1]);
+                    } else {
+                        errors = true;
+                        bytes.push(b'?');
+                    }
+                }
+                Self::Whatwg(_) => unreachable!(),
+            }
+        }
+        (Cow::Owned(bytes), self, errors)
+    }
+}
+
+/// Get the legacy encoding for a DXF code page string.
+///
+/// Returns `None` for ASCII and UTF-8. Unknown names retain the historical
+/// Windows-1252 fallback.
+///
+/// # Rules
+/// - If the DXF version is AC1021 (AutoCAD 2007+) or later, UTF-8 is always
+///   used regardless of $DWGCODEPAGE — callers should not call this function.
+/// - Otherwise, the code page string (case-insensitive) is looked up in the
+///   mapping table.
+pub fn encoding_from_code_page(code_page: &str) -> Option<LegacyEncoding> {
+    if matches!(
+        code_page.to_ascii_lowercase().as_str(),
+        "ascii" | "utf-8" | "utf8" | "unicode"
+    ) {
+        return None;
+    }
+    try_encoding_from_code_page(code_page).or(Some(encoding_rs::WINDOWS_1252.into()))
+}
+
+/// Resolve an explicit legacy encoding without silently falling back for typos.
+/// Returns `None` for unknown names, ASCII, and UTF-8.
+pub fn try_encoding_from_code_page(code_page: &str) -> Option<LegacyEncoding> {
+    let page = code_page.to_ascii_lowercase();
+    let oem = match page.as_str() {
+        "dos437" => Some(437),
+        "dos850" => Some(850),
+        "dos852" => Some(852),
+        "dos855" => Some(855),
+        "dos857" => Some(857),
+        "dos860" => Some(860),
+        "dos861" => Some(861),
+        "dos863" => Some(863),
+        "dos864" => Some(864),
+        "dos865" => Some(865),
+        "dos869" => Some(869),
+        _ => None,
+    };
+    if let Some(page) = oem {
+        return Some(LegacyEncoding::Oem(page));
+    }
+    if page == "johab" {
+        return Some(LegacyEncoding::Johab);
+    }
+    let encoding = match page.as_str() {
+        // Asian encodings
+        "gb2312" | "ansi_936" => Some(encoding_rs::GBK),
+        "big5" | "ansi_950" | "dos950" => Some(encoding_rs::BIG5),
+        "korean" | "ansi_949" => Some(encoding_rs::EUC_KR),
+        "ansi_932" | "dos932" => Some(encoding_rs::SHIFT_JIS),
+        "mac-roman" => Some(encoding_rs::MACINTOSH),
+
+        // DOS/OEM code pages
+        "dos866" => Some(encoding_rs::IBM866),
+
+        // Windows/ANSI code pages
+        "ansi_874" => Some(encoding_rs::WINDOWS_874),
+        "ansi_1250" => Some(encoding_rs::WINDOWS_1250),
+        "ansi_1251" => Some(encoding_rs::WINDOWS_1251),
+        "ansi_1252" => Some(encoding_rs::WINDOWS_1252),
+        "ansi_1253" => Some(encoding_rs::WINDOWS_1253),
+        "ansi_1254" => Some(encoding_rs::WINDOWS_1254),
+        "ansi_1255" => Some(encoding_rs::WINDOWS_1255),
+        "ansi_1256" => Some(encoding_rs::WINDOWS_1256),
+        "ansi_1257" => Some(encoding_rs::WINDOWS_1257),
+        "ansi_1258" => Some(encoding_rs::WINDOWS_1258),
+
+        // ISO encodings
+        "iso8859-1" | "iso_8859-1" => Some(encoding_rs::WINDOWS_1252),
+        "iso8859-2" | "iso_8859-2" => Some(encoding_rs::ISO_8859_2),
+        "iso8859-3" | "iso_8859-3" => Some(encoding_rs::ISO_8859_3),
+        "iso8859-4" | "iso_8859-4" => Some(encoding_rs::ISO_8859_4),
+        "iso8859-5" | "iso_8859-5" => Some(encoding_rs::ISO_8859_5),
+        "iso8859-6" | "iso_8859-6" => Some(encoding_rs::ISO_8859_6),
+        "iso8859-7" | "iso_8859-7" => Some(encoding_rs::ISO_8859_7),
+        "iso8859-8" | "iso_8859-8" => Some(encoding_rs::ISO_8859_8),
+        "iso8859-9" | "iso_8859-9" => Some(encoding_rs::WINDOWS_1254),
+        "iso8859-10" | "iso_8859-10" => Some(encoding_rs::ISO_8859_10),
+        "iso8859-13" | "iso_8859-13" => Some(encoding_rs::ISO_8859_13),
+        "iso8859-14" | "iso_8859-14" => Some(encoding_rs::ISO_8859_14),
+        "iso8859-15" | "iso_8859-15" => Some(encoding_rs::ISO_8859_15),
+
+        // KOI8-R (Russian)
+        "koi8-r" => Some(encoding_rs::KOI8_R),
+        "koi8-u" => Some(encoding_rs::KOI8_U),
+
+        // ASCII / UTF-8 / no fallback needed
+        "ascii" | "utf-8" | "utf8" | "unicode" => None,
+
+        _ => None,
+    };
+    encoding.map(LegacyEncoding::from)
+}
+
+/// Resolve the compact code-page index stored in DWG file metadata.
+pub fn dwg_code_page_name(index: u16) -> &'static str {
+    match index {
+        1 => "ASCII",
+        2 => "ISO8859-1",
+        3 => "ISO8859-2",
+        4 => "ISO8859-3",
+        5 => "ISO8859-4",
+        6 => "ISO8859-5",
+        7 => "ISO8859-6",
+        8 => "ISO8859-7",
+        9 => "ISO8859-8",
+        10 => "ISO8859-9",
+        11 => "DOS437",
+        12 => "DOS850",
+        13 => "DOS852",
+        14 => "DOS855",
+        15 => "DOS857",
+        16 => "DOS860",
+        17 => "DOS861",
+        18 => "DOS863",
+        19 => "DOS864",
+        20 => "DOS865",
+        21 => "DOS869",
+        22 | 38 => "ANSI_932",
+        23 => "MAC-ROMAN",
+        24 | 41 => "BIG5",
+        25 | 40 => "KOREAN",
+        26 | 42 => "JOHAB",
+        27 => "DOS866",
+        28 => "ANSI_1250",
+        29 => "ANSI_1251",
+        30 => "ANSI_1252",
+        31 | 39 => "GB2312",
+        32 => "ANSI_1253",
+        33 => "ANSI_1254",
+        34 => "ANSI_1255",
+        35 => "ANSI_1256",
+        36 => "ANSI_1257",
+        37 => "ANSI_874",
+        43 => "UTF-8",
+        44 => "ANSI_1258",
+        _ => "ANSI_1252",
+    }
+}
+
+/// Convert a DXF `$DWGCODEPAGE` name to the compact DWG metadata index.
+pub fn dwg_code_page_index(code_page: &str) -> u16 {
+    match code_page.to_ascii_lowercase().as_str() {
+        "ascii" => 1,
+        "iso8859-1" | "iso_8859-1" => 2,
+        "iso8859-2" | "iso_8859-2" => 3,
+        "iso8859-3" | "iso_8859-3" => 4,
+        "iso8859-4" | "iso_8859-4" => 5,
+        "iso8859-5" | "iso_8859-5" => 6,
+        "iso8859-6" | "iso_8859-6" => 7,
+        "iso8859-7" | "iso_8859-7" => 8,
+        "iso8859-8" | "iso_8859-8" => 9,
+        "iso8859-9" | "iso_8859-9" => 10,
+        "dos437" => 11,
+        "dos850" => 12,
+        "dos852" => 13,
+        "dos855" => 14,
+        "dos857" => 15,
+        "dos860" => 16,
+        "dos861" => 17,
+        "dos863" => 18,
+        "dos864" => 19,
+        "dos865" => 20,
+        "dos869" => 21,
+        "ansi_932" | "dos932" => 22,
+        "mac-roman" => 23,
+        "big5" | "ansi_950" | "dos950" => 24,
+        "korean" | "ansi_949" => 25,
+        "johab" => 26,
+        "dos866" => 27,
+        "ansi_1250" | "ansi1250" => 28,
+        "ansi_1251" | "ansi1251" => 29,
+        "ansi_1252" | "ansi1252" => 30,
+        "gb2312" | "ansi_936" => 31,
+        "ansi_1253" | "ansi1253" => 32,
+        "ansi_1254" | "ansi1254" => 33,
+        "ansi_1255" | "ansi1255" => 34,
+        "ansi_1256" | "ansi1256" => 35,
+        "ansi_1257" | "ansi1257" => 36,
+        "ansi_874" => 37,
+        "utf-8" | "utf8" | "unicode" => 43,
+        "ansi_1258" | "ansi1258" => 44,
+        _ => 30,
+    }
+}
+
+pub fn encoding_from_dwg_code_page(index: u16) -> LegacyEncoding {
+    encoding_from_code_page(dwg_code_page_name(index)).unwrap_or(encoding_rs::WINDOWS_1252.into())
+}
+
+/// Encode a string to a legacy (pre-UTF-16) DWG code page.
+///
+/// Characters the code page cannot represent are emitted as AutoCAD CIF
+/// `\U+XXXX` escapes (astral-plane characters as a surrogate pair of
+/// escapes) instead of `encoding_rs`'s HTML `&#NNNNN;` references, which
+/// no CAD application understands. Well-formed CIF escapes round-trip
+/// through [`decode_cif_escapes`].
+pub fn encode_legacy_string(text: &str, encoding: impl Into<LegacyEncoding>) -> Vec<u8> {
+    let encoding = encoding.into();
+    let (encoded, _, unmappable) = encoding.encode(text);
+    if !unmappable {
+        return encoded.into_owned();
+    }
+    let mut out = Vec::with_capacity(text.len() + 6);
+    let mut buf = [0u8; 4];
+    for ch in text.chars() {
+        // Every DWG code page is stateless, so per-char encoding is safe.
+        let (bytes, _, err) = encoding.encode(ch.encode_utf8(&mut buf));
+        if err {
+            let mut units = [0u16; 2];
+            for unit in ch.encode_utf16(&mut units) {
+                out.extend_from_slice(format!("\\U+{:04X}", unit).as_bytes());
+            }
+        } else {
+            out.extend_from_slice(&bytes);
+        }
+    }
+    out
+}
+
+/// Decode AutoCAD CIF `\U+XXXX` escapes (exactly four hex digits) into
+/// Unicode characters.
+///
+/// A high-surrogate escape followed by a low-surrogate escape combines into
+/// a scalar value. Malformed or unterminated escapes are left as literal
+/// text, and invalid code points are dropped — matching the MTEXT
+/// formatter's behavior for the same escapes.
+pub fn decode_cif_escapes(text: &str) -> String {
+    if !text.contains("\\U+") {
+        return text.to_string();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let len = chars.len();
+    let hex_at = |start: usize| -> Option<u16> {
+        if start + 4 > len {
+            return None;
+        }
+        let hex: String = chars[start..start + 4].iter().collect();
+        u16::from_str_radix(&hex, 16).ok()
+    };
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < len {
+        if chars[i] == '\\' && i + 7 <= len && chars[i + 1] == 'U' && chars[i + 2] == '+' {
+            if let Some(unit) = hex_at(i + 3) {
+                i += 7;
+                let mut units = [unit, 0];
+                let mut count = 1usize;
+                // Combine a following low-surrogate escape into one scalar.
+                if (0xD800..0xDC00).contains(&unit)
+                    && i + 7 <= len
+                    && chars[i] == '\\'
+                    && chars[i + 1] == 'U'
+                    && chars[i + 2] == '+'
+                {
+                    if let Some(low) = hex_at(i + 3) {
+                        if (0xDC00..0xE000).contains(&low) {
+                            units[1] = low;
+                            count = 2;
+                            i += 7;
+                        }
+                    }
+                }
+                if let Some(Ok(ch)) = std::char::decode_utf16(units[..count].iter().copied()).next()
+                {
+                    out.push(ch);
+                }
+                continue;
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
+/// Decode AutoCAD MIF `\M+nxxyy` escapes into Unicode characters.
+///
+/// The digit `n` selects the legacy double-byte code page: 1 is Shift-JIS,
+/// 2 is Big5, 3 is EUC-KR, 4 is Johab, and 5 is GB2312/GBK. The following
+/// four hexadecimal digits are decoded as the two bytes in that code page.
+/// Malformed escapes and byte sequences that the selected encoding cannot
+/// decode are left as literal text.
+pub fn decode_mif_escapes(text: &str) -> String {
+    if !text.contains("\\M+") {
+        return text.to_string();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let len = chars.len();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < len {
+        if i + 8 <= len && chars[i] == '\\' && chars[i + 1] == 'M' && chars[i + 2] == '+' {
+            let encoding = match chars[i + 3] {
+                '1' => Some(encoding_rs::SHIFT_JIS.into()),
+                '2' => Some(encoding_rs::BIG5.into()),
+                '3' => Some(encoding_rs::EUC_KR.into()),
+                '4' => Some(LegacyEncoding::Johab),
+                '5' => Some(encoding_rs::GBK.into()),
+                _ => None,
+            };
+            if let Some(encoding) = encoding {
+                let hex: String = chars[i + 4..i + 8].iter().collect();
+                if let Ok(value) = u16::from_str_radix(&hex, 16) {
+                    let bytes = value.to_be_bytes();
+                    let (decoded, _, had_errors) = encoding.decode(&bytes);
+                    if !had_errors {
+                        out.push_str(&decoded);
+                        i += 8;
+                        continue;
+                    }
+                }
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
+pub fn has_legacy_escape(text: &str) -> bool {
+    text.contains("\\U+") || text.contains("\\M+")
+}
+
+/// Decode both legacy AutoCAD escape formats found in pre-Unicode strings.
+pub fn decode_legacy_escapes(text: &str) -> String {
+    decode_cif_escapes(&decode_mif_escapes(text))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ansi_1252() {
+        let enc = encoding_from_code_page("ANSI_1252");
+        assert_eq!(enc, Some(encoding_rs::WINDOWS_1252.into()));
+    }
+
+    #[test]
+    fn test_case_insensitive() {
+        assert_eq!(
+            encoding_from_code_page("ansi_1251"),
+            encoding_from_code_page("ANSI_1251")
+        );
+    }
+
+    #[test]
+    fn test_ascii_returns_none() {
+        assert_eq!(encoding_from_code_page("ASCII"), None);
+    }
+
+    #[test]
+    fn test_utf8_returns_none() {
+        assert_eq!(encoding_from_code_page("UTF-8"), None);
+    }
+
+    #[test]
+    fn test_unknown_returns_windows1252() {
+        let enc = encoding_from_code_page("SOMETHING_UNKNOWN");
+        assert_eq!(enc, Some(encoding_rs::WINDOWS_1252.into()));
+    }
+
+    #[test]
+    fn test_asian_encodings() {
+        assert_eq!(
+            encoding_from_code_page("GB2312"),
+            Some(encoding_rs::GBK.into())
+        );
+        assert_eq!(
+            encoding_from_code_page("BIG5"),
+            Some(encoding_rs::BIG5.into())
+        );
+        assert_eq!(
+            encoding_from_code_page("ANSI_932"),
+            Some(encoding_rs::SHIFT_JIS.into())
+        );
+        assert_eq!(
+            encoding_from_code_page("KOREAN"),
+            Some(encoding_rs::EUC_KR.into())
+        );
+    }
+
+    #[test]
+    fn unsupported_dwg_pages_use_the_declared_fallback_encoding() {
+        for page in [
+            "KOI8-R",
+            "KOI8-U",
+            "ISO8859-10",
+            "ISO8859-13",
+            "ISO8859-14",
+            "ISO8859-15",
+        ] {
+            let index = dwg_code_page_index(page);
+            assert_eq!(index, 30);
+            assert_eq!(
+                encoding_from_dwg_code_page(index),
+                encoding_rs::WINDOWS_1252.into()
+            );
+        }
+    }
+
+    #[test]
+    fn test_decode_cif_escapes() {
+        assert_eq!(decode_cif_escapes("ab\\U+4E2Dcd"), "ab中cd");
+        assert_eq!(decode_cif_escapes("\\U+0041\\U+0042"), "AB");
+        // Exactly four hex digits: a fifth character stays literal.
+        assert_eq!(decode_cif_escapes("\\U+00412"), "A2");
+        // Malformed escapes stay literal.
+        assert_eq!(decode_cif_escapes("\\U+GGGG"), "\\U+GGGG");
+        assert_eq!(decode_cif_escapes("\\U+4E"), "\\U+4E");
+        assert_eq!(decode_cif_escapes("no escapes here"), "no escapes here");
+        // Invalid code points are dropped.
+        assert_eq!(decode_cif_escapes("\\U+D800"), "");
+        // Surrogate pair combines into a scalar.
+        assert_eq!(decode_cif_escapes("\\U+D83D\\U+DE00"), "😀");
+    }
+
+    #[test]
+    fn test_decode_mif_escapes() {
+        assert_eq!(decode_mif_escapes(r"\M+5BCFE\M+5BAC5"), "件号");
+        assert_eq!(decode_legacy_escapes(r"\M+5BCFE\U+0021"), "件!");
+        assert_eq!(decode_mif_escapes(r"\M+9BCFE"), r"\M+9BCFE");
+        assert_eq!(decode_mif_escapes(r"\M+5GGGG"), r"\M+5GGGG");
+        // Shift-JIS as SolidWorks writes it, mixed with literal text.
+        assert_eq!(
+            decode_mif_escapes("\\M+18B5A术\\M+19776\\M+18B81"),
+            "技术要求"
+        );
+        assert_eq!(decode_mif_escapes("\\M+48861"), "\u{AC00}");
+    }
+
+    #[test]
+    fn test_encode_legacy_string_cif_escapes() {
+        // Mappable chars encode directly.
+        assert_eq!(encode_legacy_string("AB", encoding_rs::WINDOWS_1252), b"AB");
+        // Unmappable chars become CIF escapes, not HTML references.
+        let encoded = encode_legacy_string("中", encoding_rs::WINDOWS_1252);
+        assert_eq!(String::from_utf8(encoded).unwrap(), "\\U+4E2D");
+        // Astral-plane chars become a surrogate pair of escapes.
+        let encoded = encode_legacy_string("😀", encoding_rs::WINDOWS_1252);
+        assert_eq!(String::from_utf8(encoded).unwrap(), "\\U+D83D\\U+DE00");
+        // GBK encodes Chinese directly with no escapes.
+        assert_eq!(encode_legacy_string("中", encoding_rs::GBK), &[0xD6, 0xD0]);
+        // Round-trip through the decoder.
+        let encoded = encode_legacy_string("a中b😀c", encoding_rs::WINDOWS_1252);
+        let text = String::from_utf8(encoded).unwrap();
+        assert_eq!(decode_cif_escapes(&text), "a中b😀c");
+    }
+}

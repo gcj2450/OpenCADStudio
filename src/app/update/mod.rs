@@ -979,6 +979,17 @@ impl OpenCADStudio {
             #[cfg(not(target_arch = "wasm32"))]
             Message::AgentSend => self.send_agent_prompt(),
             #[cfg(not(target_arch = "wasm32"))]
+            Message::AgentPickAttachments => self.pick_agent_attachments(),
+            #[cfg(not(target_arch = "wasm32"))]
+            Message::AgentAttachmentsLoaded(results) => self.agent_attachments_loaded(results),
+            #[cfg(not(target_arch = "wasm32"))]
+            Message::AgentRemoveAttachment(index) => {
+                if index < self.agent.attachments.len() {
+                    self.agent.attachments.remove(index);
+                }
+                Task::none()
+            }
+            #[cfg(not(target_arch = "wasm32"))]
             Message::AgentStop => self.stop_agent_turn(),
             #[cfg(not(target_arch = "wasm32"))]
             Message::AgentToggleHistory => self.toggle_agent_history(),

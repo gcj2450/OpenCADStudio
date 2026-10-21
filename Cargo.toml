@@ -15,6 +15,7 @@ members = [
     "crates/dwg-thumbnailer",
     "crates/dwg-thumbnailer-win",
 ]
+exclude = ["vendor/opencadcodec"]
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
@@ -115,6 +116,9 @@ iced_core = { git = "https://github.com/iced-rs/iced.git", rev = "23604ff22ab0aa
 iced_widget = { git = "https://github.com/iced-rs/iced.git", rev = "23604ff22ab0aad9e00b9327cb7b8546ed84db39" }
 tokio-tungstenite = { git = "https://github.com/openai-oss-forks/tokio-tungstenite", rev = "0e5b2d73aa18dd9f0a50ee9ff199d5aef7594186" }
 tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev = "4fffad30fe373adbdcffab9545e9e9bf4f2fc19f" }
+
+[patch."https://github.com/HakanSeven12/opencadcodec.git"]
+opencadcodec = { path = "vendor/opencadcodec" }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 getrandom = "0.3"

@@ -1,0 +1,972 @@
+//! Plot style tables: the CTB (color-based) and STB (named) files a plot
+//! reads its pens from.
+//!
+//! A table is a 60-byte header followed by a zlib-compressed text body. This
+//! module holds the logical model and its codec (bytes ↔ table); where the
+//! files live and which one a layout picks is the application's business.
+
+use std::collections::HashMap;
+use std::io::Read;
+
+// ── Standard lineweight table (index → mm) ───────────────────────────────────
+
+/// Lineweight table: index value → mm, matching the stored LWEIGHT codes.
+/// Index 0 = 0.00 mm (hairline), others follow the DXF lineweight enum.
+pub const LW_TABLE: &[f32] = &[
+    0.00, 0.05, 0.09, 0.10, 0.13, 0.15, 0.18, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.53, 0.60,
+    0.65, 0.70, 0.80, 0.90, 1.00, 1.06, 1.20, 1.40, 1.58, 2.00, 2.11,
+];
+
+// ── Per-color entry ───────────────────────────────────────────────────────────
+
+/// A single entry in a CTB or STB plot style table.
+#[derive(Debug, Clone)]
+pub struct PlotStyleEntry {
+    pub name: String,
+    pub localized_name: String,
+    pub description: String,
+    /// If `Some([r,g,b])`, override the entity color with this RGB value (0..255).
+    /// If `None`, use the object color.
+    pub color: Option<[u8; 3]>,
+    /// Lineweight index into the table. 0 (and legacy 255) = object lineweight.
+    pub lineweight: u8,
+    /// Screen percentage 0–100 (100 = opaque).
+    pub screening: u8,
+    pub color_policy: u8,
+    pub physical_pen_number: u16,
+    pub virtual_pen_number: u16,
+    pub linepattern_size: f32,
+    pub linetype: u8,
+    pub adaptive_linetype: bool,
+    pub fill_style: u8,
+    pub end_style: u8,
+    pub join_style: u8,
+}
+
+impl Default for PlotStyleEntry {
+    fn default() -> Self {
+        PlotStyleEntry {
+            name: String::new(),
+            localized_name: String::new(),
+            description: String::new(),
+            color: None,
+            lineweight: 0,
+            screening: 100,
+            color_policy: 1,
+            physical_pen_number: 0,
+            virtual_pen_number: 0,
+            linepattern_size: 0.5,
+            linetype: 31,
+            adaptive_linetype: true,
+            fill_style: 73,
+            end_style: 4,
+            join_style: 5,
+        }
+    }
+}
+
+// ── Plot Style Table ──────────────────────────────────────────────────────────
+
+/// A loaded CTB or STB plot style table.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct PlotStyleTable {
+    /// File name (without path), e.g. "monochrome.ctb".
+    pub name: String,
+    /// Whether this is a named-style (STB) table rather than color-based (CTB).
+    pub is_stb: bool,
+    pub description: String,
+    pub scale_factor: f32,
+    pub apply_factor: bool,
+    pub custom_lineweight_display_units: u8,
+    pub lineweights: Vec<f32>,
+    /// For CTB: entries indexed by ACI (index 0 unused; 1..=255 are valid).
+    pub aci_entries: Vec<PlotStyleEntry>, // 256 entries, index = ACI
+    /// For STB: named style entries.
+    pub named_entries: HashMap<String, PlotStyleEntry>,
+    /// What had to be tolerated to read the file (a bad checksum, a length
+    /// that did not add up, descriptions in a Windows code page): the file
+    /// loaded, but the user deserves to know it was not quite as written.
+    pub load_warnings: Vec<String>,
+}
+
+impl PlotStyleTable {
+    /// Create an identity CTB table (no overrides for any color).
+    pub fn identity(name: impl Into<String>) -> Self {
+        PlotStyleTable {
+            name: name.into(),
+            is_stb: false,
+            description: String::new(),
+            scale_factor: 1.0,
+            apply_factor: false,
+            custom_lineweight_display_units: 0,
+            lineweights: LW_TABLE.to_vec(),
+            aci_entries: (0..=255).map(|_| PlotStyleEntry::default()).collect(),
+            named_entries: HashMap::default(),
+            load_warnings: Vec::new(),
+        }
+    }
+
+    pub fn from_bytes(name: impl Into<String>, raw: &[u8]) -> Result<Self, String> {
+        let name = name.into();
+        let is_stb = name.to_ascii_lowercase().ends_with(".stb");
+        let (text, warnings) = decompress_ctb(raw)?;
+        let mut table = parse_plot_style_text(&text, name, is_stb)?;
+        table.load_warnings = warnings;
+        Ok(table)
+    }
+
+    /// Encode this table as CTB/STB file bytes.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, String> {
+        compress_ctb(self.to_text().as_bytes())
+    }
+
+    /// Resolve the effective print RGB color for the given ACI index.
+    /// Returns None if no override (use object color).
+    pub fn resolve_color(&self, aci: u8) -> Option<[f32; 3]> {
+        let entry = self.aci_entries.get(aci as usize)?;
+        let mut color = entry
+            .color
+            .map(|[r, g, b]| [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0]);
+        if entry.color_policy & 2 != 0 {
+            let rgb = color.or_else(|| {
+                if aci == 7 {
+                    Some([0.0; 3])
+                } else {
+                    crate::types::aci_to_rgb(aci)
+                        .map(|(r, g, b)| [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0])
+                }
+            })?;
+            let gray = 0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2];
+            color = Some([gray; 3]);
+        }
+        color
+    }
+
+    /// Resolve the effective lineweight in mm for the given ACI index.
+    /// Returns None if no override (use object lineweight).
+    pub fn resolve_lineweight(&self, aci: u8) -> Option<f32> {
+        let entry = self.aci_entries.get(aci as usize)?;
+        if matches!(entry.lineweight, 0 | 255) {
+            None
+        } else {
+            self.lineweights
+                .get(entry.lineweight as usize)
+                .copied()
+                .map(|weight| {
+                    if self.apply_factor {
+                        weight * self.scale_factor.max(0.0)
+                    } else {
+                        weight
+                    }
+                })
+        }
+    }
+
+    /// Resolve the screening factor for the given ACI index.
+    pub fn resolve_screening(&self, aci: u8) -> f32 {
+        self.aci_entries
+            .get(aci as usize)
+            .map(|entry| entry.screening.min(100) as f32 / 100.0)
+            .unwrap_or(1.0)
+    }
+
+    // ── Internal serialisation ────────────────────────────────────────────
+
+    /// The table's text body, as stored compressed in the file.
+    pub fn to_text(&self) -> String {
+        let mut s = String::new();
+        let description = self.description.replace(['\r', '\n'], " ");
+        s.push_str(&format!("description=\"{description}\n"));
+        s.push_str("aci_table_available=TRUE\n");
+        // The factor scales every lineweight when applied, so write it in full.
+        s.push_str(&format!("scale_factor={}\n", full_real(self.scale_factor)));
+        s.push_str(&format!(
+            "apply_factor={}\n",
+            if self.apply_factor { "TRUE" } else { "FALSE" }
+        ));
+        s.push_str(&format!(
+            "custom_lineweight_display_units={}\n",
+            self.custom_lineweight_display_units
+        ));
+        s.push_str("aci_table{\n");
+        for index in 0..255 {
+            s.push_str(&format!(" {index}=\"Color_{}\n", index + 1));
+        }
+        s.push_str("}\nplot_style{\n");
+        for (index, entry) in self.aci_entries.iter().enumerate().skip(1).take(255) {
+            let style_index = index - 1;
+            let style_name = if entry.name.is_empty() {
+                format!("Color_{index}")
+            } else {
+                entry.name.replace(['\r', '\n'], " ")
+            };
+            let localized_name = if entry.localized_name.is_empty() {
+                style_name.clone()
+            } else {
+                entry.localized_name.replace(['\r', '\n'], " ")
+            };
+            let description = entry.description.replace(['\r', '\n'], " ");
+            s.push_str(&format!(" {style_index}{{\n"));
+            s.push_str(&format!("  name=\"{style_name}\n"));
+            s.push_str(&format!("  localized_name=\"{localized_name}\n"));
+            s.push_str(&format!("  description=\"{description}\n"));
+            if let Some(rgb) = entry.color {
+                let packed = packed_rgb(rgb);
+                s.push_str(&format!("  color={packed}\n  mode_color={packed}\n"));
+            } else {
+                s.push_str("  color=-1\n");
+            }
+            s.push_str(&format!("  color_policy={}\n", entry.color_policy));
+            s.push_str(&format!(
+                "  physical_pen_number={}\n  virtual_pen_number={}\n",
+                entry.physical_pen_number, entry.virtual_pen_number
+            ));
+            s.push_str(&format!("  screen={}\n", entry.screening));
+            s.push_str(&format!(
+                "  linepattern_size={}\n  linetype={}\n  adaptive_linetype={}\n",
+                entry.linepattern_size,
+                entry.linetype,
+                if entry.adaptive_linetype {
+                    "TRUE"
+                } else {
+                    "FALSE"
+                }
+            ));
+            s.push_str(&format!("  lineweight={}\n", entry.lineweight));
+            s.push_str(&format!(
+                "  fill_style={}\n  end_style={}\n  join_style={}\n }}\n",
+                entry.fill_style, entry.end_style, entry.join_style
+            ));
+        }
+        s.push_str("}\ncustom_lineweight_table{\n");
+        for (index, weight) in self.lineweights.iter().enumerate() {
+            s.push_str(&format!(" {index}={}\n", full_real(*weight)));
+        }
+        s.push_str("}\n");
+        s
+    }
+}
+
+// ── Deflate helpers ───────────────────────────────────────────────────────────
+
+/// Decompress a CTB/STB file's raw bytes into the text content, with the
+/// things that had to be tolerated on the way.
+///
+/// Files written by other applications are read as they are, not as the
+/// container says they should be: a checksum or a length that does not add
+/// up is reported and read past (the text is either there or the zlib
+/// stream fails on its own), a zlib stream with a bad trailer is retried as
+/// raw deflate, and text that is not UTF-8 is read as Windows-1252 — the
+/// code page those applications write descriptions in.
+fn decompress_ctb(data: &[u8]) -> Result<(String, Vec<String>), String> {
+    const PREFIX: &[u8] = b"PIAFILEVERSION_2.0,CTBVER1,compress\r\npmzlibcodec";
+    let mut warnings = Vec::new();
+    let mut decoded;
+    if data.starts_with(PREFIX) {
+        if data.len() < 60 {
+            return Err("CTB header is truncated".into());
+        }
+        let checksum = u32::from_le_bytes(data[48..52].try_into().unwrap());
+        let text_len = u32::from_le_bytes(data[52..56].try_into().unwrap()) as usize;
+        let compressed_len = u32::from_le_bytes(data[56..60].try_into().unwrap()) as usize;
+        let available = data.len() - 60;
+        let payload = if compressed_len > available {
+            warnings.push(format!(
+                "the header announces {compressed_len} compressed bytes \
+                 but the file holds {available}"
+            ));
+            &data[60..]
+        } else {
+            &data[60..60 + compressed_len]
+        };
+        if adler32(payload) != checksum {
+            warnings.push("the compressed payload's checksum does not match".into());
+        }
+        decoded = inflate_lenient(payload, &mut warnings)?;
+        // A byte or a few short is a header that counted its trailing NUL
+        // differently; far short of the announced text is a cut-off file,
+        // which the inflater does not always notice on its own.
+        const TOLERATED_SHORTFALL: usize = 16;
+        if decoded.len() + TOLERATED_SHORTFALL < text_len {
+            return Err(format!(
+                "CTB text is incomplete: the header announces {text_len} bytes \
+                 but only {} could be read",
+                decoded.len()
+            ));
+        }
+        if decoded.len() != text_len {
+            warnings.push(format!(
+                "the header announces {text_len} bytes of text but {} were read",
+                decoded.len()
+            ));
+        }
+    } else {
+        let split_at = data
+            .iter()
+            .position(|&b| b == b'\n')
+            .map(|p| p + 1)
+            .unwrap_or(0);
+        let payload = &data[split_at..];
+        if payload.starts_with(&[0x78]) {
+            decoded = inflate_lenient(payload, &mut warnings)?;
+        } else {
+            use flate2::read::DeflateDecoder;
+            decoded = inflate_capped(
+                DeflateDecoder::new(payload),
+                "legacy CTB deflate decompress",
+            )?;
+        }
+    }
+    while decoded.last() == Some(&0) {
+        decoded.pop();
+    }
+    let (text, code_page) = decode_plot_style_text(decoded);
+    if let Some(note) = code_page {
+        warnings.push(note);
+    }
+    Ok((text, warnings))
+}
+
+/// Far above any real plot-style table (a CTB is a text config file), so a
+/// crafted few-hundred-KB payload cannot inflate until memory runs out —
+/// flate2's readers have no output budget of their own. Same idea as the
+/// `STREAM_LIMIT` in `dgn8.rs`.
+const MAX_INFLATED_BYTES: u64 = 64 * 1024 * 1024;
+
+/// One decompression with a hard output budget: `read_to_end` grows its
+/// `Vec` without bound, so the reader is capped and a payload that reaches
+/// past the cap is refused — an allocation failure is an *abort*, not a
+/// catchable panic. The reader is allowed one byte past the cap:
+/// `take(cap)` stops *at* the cap, which cannot distinguish "exactly cap"
+/// (within the contract — "exceeds means exceeds") from "at least cap",
+/// so `cap + 1` makes the boundary unambiguous.
+fn inflate_capped(reader: impl Read, what: &str) -> Result<Vec<u8>, String> {
+    let mut out = Vec::new();
+    let read = reader
+        .take(MAX_INFLATED_BYTES + 1)
+        .read_to_end(&mut out)
+        .map_err(|e| format!("{what}: {e}"))?;
+    if read as u64 > MAX_INFLATED_BYTES {
+        return Err(format!(
+            "{what}: inflated data exceeds the {MAX_INFLATED_BYTES}-byte limit"
+        ));
+    }
+    Ok(out)
+}
+
+/// Inflate a zlib stream, falling back to the raw deflate data behind its
+/// two-byte header when the stream's own trailer is wrong.
+fn inflate_lenient(payload: &[u8], warnings: &mut Vec<String>) -> Result<Vec<u8>, String> {
+    use flate2::read::{DeflateDecoder, ZlibDecoder};
+    match inflate_capped(ZlibDecoder::new(payload), "CTB zlib decompress") {
+        Ok(decoded) => Ok(decoded),
+        Err(zlib_error) if payload.len() > 2 => {
+            let raw = inflate_capped(DeflateDecoder::new(&payload[2..]), "CTB zlib decompress")
+                .map_err(|_| zlib_error)?;
+            warnings.push("the zlib stream is damaged; its deflate data was read directly".into());
+            Ok(raw)
+        }
+        Err(zlib_error) => Err(zlib_error),
+    }
+}
+
+/// The table's text out of its bytes: UTF-8 when it is, else Windows-1252
+/// (Latin-1 with the 0x80–0x9F block the code page defines), which is what
+/// applications on Western systems write into descriptions. Other code
+/// pages come out as readable but wrong characters in descriptions only —
+/// pens and colours are numbers and unaffected. The second value says when
+/// the fallback was taken.
+pub fn decode_plot_style_text(bytes: Vec<u8>) -> (String, Option<String>) {
+    match String::from_utf8(bytes) {
+        Ok(text) => (text, None),
+        Err(error) => {
+            let text = error
+                .into_bytes()
+                .into_iter()
+                .map(windows_1252_char)
+                .collect();
+            (
+                text,
+                Some("descriptions were read as Windows-1252 text (the file is not UTF-8)".into()),
+            )
+        }
+    }
+}
+
+/// One Windows-1252 byte as a character: Latin-1 except for the 0x80–0x9F
+/// block, which the code page fills with punctuation and accented letters.
+fn windows_1252_char(byte: u8) -> char {
+    const HIGH: [char; 32] = [
+        '\u{20AC}', '\u{FFFD}', '\u{201A}', '\u{0192}', '\u{201E}', '\u{2026}', '\u{2020}',
+        '\u{2021}', '\u{02C6}', '\u{2030}', '\u{0160}', '\u{2039}', '\u{0152}', '\u{FFFD}',
+        '\u{017D}', '\u{FFFD}', '\u{FFFD}', '\u{2018}', '\u{2019}', '\u{201C}', '\u{201D}',
+        '\u{2022}', '\u{2013}', '\u{2014}', '\u{02DC}', '\u{2122}', '\u{0161}', '\u{203A}',
+        '\u{0153}', '\u{FFFD}', '\u{017E}', '\u{0178}',
+    ];
+    match byte {
+        0x80..=0x9F => HIGH[usize::from(byte - 0x80)],
+        _ => char::from(byte),
+    }
+}
+
+/// Compress plot-style text content as a CTB/STB file.
+fn compress_ctb(text: &[u8]) -> Result<Vec<u8>, String> {
+    use flate2::{write::ZlibEncoder, Compression};
+    use std::io::Write;
+    const PREFIX: &[u8] = b"PIAFILEVERSION_2.0,CTBVER1,compress\r\npmzlibcodec";
+    let mut body = text.to_vec();
+    body.push(0);
+    let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+    enc.write_all(&body).map_err(|e| e.to_string())?;
+    let compressed = enc.finish().map_err(|e| e.to_string())?;
+    let mut out = PREFIX.to_vec();
+    out.extend_from_slice(&adler32(&compressed).to_le_bytes());
+    out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    out.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
+    out.extend_from_slice(&compressed);
+    Ok(out)
+}
+
+fn adler32(bytes: &[u8]) -> u32 {
+    const MOD: u32 = 65_521;
+    let mut a = 1u32;
+    let mut b = 0u32;
+    for byte in bytes {
+        a = (a + u32::from(*byte)) % MOD;
+        b = (b + a) % MOD;
+    }
+    (b << 16) | a
+}
+
+/// A real number written in full, keeping the decimal point on a whole value.
+fn full_real(value: f32) -> String {
+    let mut text = value.to_string();
+    if text.chars().all(|c| c.is_ascii_digit() || c == '-') {
+        text.push_str(".0");
+    }
+    text
+}
+
+fn packed_rgb([r, g, b]: [u8; 3]) -> i32 {
+    u32::from_be_bytes([0xC2, r, g, b]) as i32
+}
+
+// ── Text parser ───────────────────────────────────────────────────────────────
+
+fn parse_plot_style_text(text: &str, name: String, is_stb: bool) -> Result<PlotStyleTable, String> {
+    if text.lines().any(|line| line.trim() == "begin_plot_style") {
+        return parse_legacy_plot_style_text(text, name, is_stb);
+    }
+
+    #[derive(Default)]
+    struct PendingStyle {
+        index: usize,
+        name: String,
+        entry: PlotStyleEntry,
+        color: Option<i32>,
+        mode_color: Option<i32>,
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Section {
+        Root,
+        Other,
+        PlotStyles,
+        Lineweights,
+    }
+
+    let mut aci_entries: Vec<PlotStyleEntry> =
+        (0..=255).map(|_| PlotStyleEntry::default()).collect();
+    let mut named_entries: HashMap<String, PlotStyleEntry> = HashMap::default();
+    let mut description = String::new();
+    let mut scale_factor = 1.0f32;
+    let mut apply_factor = false;
+    let mut custom_lineweight_display_units = 0u8;
+    let mut lineweights = Vec::<f32>::new();
+    let mut section = Section::Root;
+    let mut current: Option<PendingStyle> = None;
+
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line == "plot_style{" {
+            section = Section::PlotStyles;
+            continue;
+        }
+        if line == "custom_lineweight_table{" {
+            section = Section::Lineweights;
+            continue;
+        }
+        if line.ends_with('{') {
+            if section == Section::PlotStyles && current.is_none() {
+                if let Ok(index) = line.trim_end_matches('{').trim().parse::<usize>() {
+                    let default_name = format!("Color_{}", index + 1);
+                    let mut style = PendingStyle {
+                        index,
+                        name: default_name.clone(),
+                        ..Default::default()
+                    };
+                    style.entry.name = default_name.clone();
+                    style.entry.localized_name = default_name;
+                    current = Some(style);
+                    continue;
+                }
+            }
+            section = Section::Other;
+            continue;
+        }
+        if line == "}" {
+            if let Some(mut style) = current.take() {
+                let packed = style.mode_color.or(style.color);
+                style.entry.color = packed.and_then(unpack_plot_color);
+                if is_stb {
+                    named_entries.insert(style.name, style.entry);
+                } else if style.index < 255 {
+                    aci_entries[style.index + 1] = style.entry;
+                }
+            } else {
+                section = Section::Root;
+            }
+            continue;
+        }
+
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        let value = value.trim().trim_start_matches('"');
+        if let Some(style) = current.as_mut() {
+            match key {
+                "name" => {
+                    style.name = value.to_string();
+                    style.entry.name = value.to_string();
+                }
+                "localized_name" => style.entry.localized_name = value.to_string(),
+                "description" => {
+                    style.entry.description = value.to_string();
+                }
+                "screen" => {
+                    if let Ok(v) = value.parse::<u8>() {
+                        style.entry.screening = v.min(100);
+                    }
+                }
+                "lineweight" => {
+                    if let Ok(v) = value.parse::<u8>() {
+                        style.entry.lineweight = v;
+                    }
+                }
+                "color" => style.color = value.parse::<i32>().ok(),
+                "mode_color" => style.mode_color = value.parse::<i32>().ok(),
+                "color_policy" => style.entry.color_policy = value.parse().unwrap_or(1),
+                "physical_pen_number" => {
+                    style.entry.physical_pen_number = value.parse().unwrap_or(0)
+                }
+                "virtual_pen_number" => style.entry.virtual_pen_number = value.parse().unwrap_or(0),
+                "linepattern_size" => style.entry.linepattern_size = value.parse().unwrap_or(0.5),
+                "linetype" => style.entry.linetype = value.parse().unwrap_or(31),
+                "adaptive_linetype" => {
+                    style.entry.adaptive_linetype = value.eq_ignore_ascii_case("TRUE")
+                }
+                "fill_style" => style.entry.fill_style = value.parse().unwrap_or(73),
+                "end_style" => style.entry.end_style = value.parse().unwrap_or(4),
+                "join_style" => style.entry.join_style = value.parse().unwrap_or(5),
+                _ => {}
+            }
+            continue;
+        }
+
+        match section {
+            Section::Root => match key {
+                "description" => description = value.to_string(),
+                "scale_factor" => scale_factor = value.parse().unwrap_or(1.0),
+                "apply_factor" => apply_factor = value.eq_ignore_ascii_case("TRUE"),
+                "custom_lineweight_display_units" => {
+                    custom_lineweight_display_units = value.parse().unwrap_or(0)
+                }
+                _ => {}
+            },
+            Section::Lineweights => {
+                // The key is file-controlled: `18446744073709551615` made
+                // `index + 1` overflow (debug panic, release wrap to
+                // `resize(0)` then OOB), and `500000000` resized a 2 GB
+                // table. Entries past 255 are unreachable — the consumer
+                // indexes with `PlotStyleEntry.lineweight: u8` — so
+                // oversized keys are ignored like other malformed lines.
+                if let (Ok(index), Ok(weight)) = (key.parse::<usize>(), value.parse::<f32>()) {
+                    if index <= u8::MAX as usize {
+                        if lineweights.len() <= index {
+                            lineweights.resize(index + 1, 0.0);
+                        }
+                        lineweights[index] = weight;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if lineweights.is_empty() {
+        lineweights = LW_TABLE.to_vec();
+    }
+
+    Ok(PlotStyleTable {
+        name,
+        is_stb,
+        description,
+        scale_factor,
+        apply_factor,
+        custom_lineweight_display_units,
+        lineweights,
+        aci_entries,
+        named_entries,
+        load_warnings: Vec::new(),
+    })
+}
+
+fn unpack_plot_color(packed: i32) -> Option<[u8; 3]> {
+    if matches!(packed, -1 | -1_006_632_961 | -1_056_964_608) {
+        return None;
+    }
+    let bytes = (packed as u32).to_be_bytes();
+    Some([bytes[1], bytes[2], bytes[3]])
+}
+
+fn parse_legacy_plot_style_text(
+    text: &str,
+    name: String,
+    is_stb: bool,
+) -> Result<PlotStyleTable, String> {
+    let mut table = PlotStyleTable::identity(name);
+    table.is_stb = is_stb;
+    let mut style_index = 1usize;
+    let mut current: Option<PlotStyleEntry> = None;
+    let mut current_name = String::new();
+    for line in text.lines().map(str::trim) {
+        if line == "begin_plot_style" {
+            current = Some(PlotStyleEntry::default());
+            current_name = format!("Color_{style_index}");
+            continue;
+        }
+        if line == "end_plot_style" {
+            if let Some(entry) = current.take() {
+                if is_stb {
+                    table.named_entries.insert(current_name.clone(), entry);
+                } else if style_index <= 255 {
+                    table.aci_entries[style_index] = entry;
+                    style_index += 1;
+                }
+            }
+            continue;
+        }
+        let Some(entry) = current.as_mut() else {
+            continue;
+        };
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let value = value.trim();
+        match key.trim() {
+            "description" => {
+                entry.description = value.to_string();
+                if !value.is_empty() {
+                    current_name = value.to_string();
+                }
+            }
+            "screen" => entry.screening = value.parse::<u8>().unwrap_or(100).min(100),
+            "lineweight" => entry.lineweight = value.parse().unwrap_or(0),
+            "color1" if value.starts_with('#') && value.len() == 7 => {
+                // The guard is a BYTE length, so `#aébé` (also 7 bytes)
+                // reaches fixed-offset slices that split a character.
+                // `str::get` is None off a char boundary; the `unwrap_or(0)`
+                // path is the same one unparseable pairs always took.
+                let pair = |range: std::ops::Range<usize>| {
+                    value
+                        .get(range)
+                        .and_then(|hex| u8::from_str_radix(hex, 16).ok())
+                        .unwrap_or(0)
+                };
+                entry.color = Some([pair(1..3), pair(3..5), pair(5..7)]);
+            }
+            "color1" => entry.color = value.parse::<i32>().ok().and_then(unpack_plot_color),
+            _ => {}
+        }
+    }
+    Ok(table)
+}
+
+#[cfg(test)]
+mod round_trip_tests {
+    use super::{compress_ctb, PlotStyleTable};
+
+    /// What SAVE writes, read back the way the Plot dialog loads it.
+    fn saved_and_reloaded(table: &PlotStyleTable) -> PlotStyleTable {
+        let bytes = compress_ctb(table.to_text().as_bytes()).expect("compress");
+        PlotStyleTable::from_bytes(table.name.clone(), &bytes).expect("reload")
+    }
+
+    /// Saving a table keeps its global scale factor, which scales every
+    /// lineweight while apply_factor is on. It used to be cut to one decimal.
+    #[test]
+    fn the_scale_factor_survives_a_save() {
+        let mut table = PlotStyleTable::identity("scaled.ctb");
+        table.apply_factor = true;
+        table.scale_factor = 0.25;
+        table.aci_entries[1].lineweight = 13; // 0.50 mm
+        let reloaded = saved_and_reloaded(&table);
+        assert_eq!(reloaded.scale_factor, 0.25);
+        assert_eq!(reloaded.resolve_lineweight(1), Some(0.125));
+    }
+
+    /// A whole factor is still written with its decimal point.
+    #[test]
+    fn a_whole_scale_factor_keeps_its_decimal_point() {
+        let table = PlotStyleTable::identity("plain.ctb");
+        assert!(table.to_text().contains("\nscale_factor=1.0\n"));
+        assert_eq!(saved_and_reloaded(&table).scale_factor, 1.0);
+    }
+
+    /// Saving keeps each custom lineweight as the table holds it. They used to
+    /// be cut to two decimals, so a 0.035 mm pen came back as a 0.04 mm one.
+    #[test]
+    fn custom_lineweights_survive_a_save() {
+        let mut table = PlotStyleTable::identity("pens.ctb");
+        table.lineweights[1] = 0.035;
+        table.aci_entries[1].lineweight = 1;
+        let reloaded = saved_and_reloaded(&table);
+        assert_eq!(reloaded.lineweights, table.lineweights);
+        assert_eq!(reloaded.resolve_lineweight(1), Some(0.035));
+    }
+}
+
+
+#[cfg(test)]
+mod lenient_loading_tests {
+    use super::{compress_ctb, decode_plot_style_text, PlotStyleTable};
+
+    fn table_with_description(description: &str) -> PlotStyleTable {
+        let mut table = PlotStyleTable::identity("foreign.ctb");
+        table.description = description.to_string();
+        table.aci_entries[1].lineweight = 13;
+        table
+    }
+
+    fn compressed(table: &PlotStyleTable) -> Vec<u8> {
+        compress_ctb(table.to_text().as_bytes()).expect("compress")
+    }
+
+    /// The pen data must survive every tolerated defect.
+    fn assert_pens_kept(table: &PlotStyleTable) {
+        assert_eq!(table.aci_entries[1].lineweight, 13);
+    }
+
+    #[test]
+    fn a_wrong_checksum_is_reported_not_fatal() {
+        let mut bytes = compressed(&table_with_description("ok"));
+        bytes[48] ^= 0xFF;
+        let table = PlotStyleTable::from_bytes("foreign.ctb", &bytes).expect("loads");
+        assert_pens_kept(&table);
+        assert_eq!(table.load_warnings.len(), 1, "{:?}", table.load_warnings);
+        assert!(table.load_warnings[0].contains("checksum"));
+    }
+
+    #[test]
+    fn a_text_length_off_by_one_and_a_short_payload_field_are_tolerated() {
+        let mut bytes = compressed(&table_with_description("ok"));
+        let text_len = u32::from_le_bytes(bytes[52..56].try_into().unwrap());
+        bytes[52..56].copy_from_slice(&(text_len - 1).to_le_bytes());
+        let table = PlotStyleTable::from_bytes("foreign.ctb", &bytes).expect("loads");
+        assert_pens_kept(&table);
+        assert!(table
+            .load_warnings
+            .iter()
+            .any(|w| w.contains("bytes of text")));
+
+        let mut bytes = compressed(&table_with_description("ok"));
+        let compressed_len = u32::from_le_bytes(bytes[56..60].try_into().unwrap());
+        bytes[56..60].copy_from_slice(&(compressed_len + 100).to_le_bytes());
+        let table = PlotStyleTable::from_bytes("foreign.ctb", &bytes).expect("loads");
+        assert_pens_kept(&table);
+        assert!(table
+            .load_warnings
+            .iter()
+            .any(|w| w.contains("compressed bytes")));
+    }
+
+    #[test]
+    fn windows_1252_descriptions_are_read_with_a_note() {
+        // "Descripción" and "Ελληνικά" are not what a Western file holds; a
+        // Western one holds e.g. "Plumas – señal" in Windows-1252.
+        let text = table_with_description("marker").to_text();
+        let mut bytes = text.into_bytes();
+        let marker = bytes.windows(6).position(|w| w == b"marker").unwrap();
+        let cp1252 = [
+            0x50, 0x6C, 0x75, 0x6D, 0x61, 0x73, 0x20, 0x96, 0x20, 0x73, 0x65, 0xF1, 0x61, 0x6C,
+        ];
+        bytes.splice(marker..marker + 6, cp1252);
+        let compressed = compress_ctb(&bytes).unwrap();
+        let table = PlotStyleTable::from_bytes("foreign.ctb", &compressed).expect("loads");
+        assert_pens_kept(&table);
+        assert_eq!(table.description, "Plumas – señal");
+        assert!(table
+            .load_warnings
+            .iter()
+            .any(|w| w.contains("Windows-1252")));
+        // Clean UTF-8 gets no note.
+        let (text, note) = decode_plot_style_text("Ελληνικά".as_bytes().to_vec());
+        assert_eq!(text, "Ελληνικά");
+        assert!(note.is_none());
+    }
+
+    #[test]
+    fn a_truncated_stream_is_still_an_error() {
+        let bytes = compressed(&table_with_description("ok"));
+        let cut = &bytes[..bytes.len() / 2];
+        let error = PlotStyleTable::from_bytes("foreign.ctb", cut).unwrap_err();
+        assert!(error.contains("incomplete"), "{error}");
+    }
+
+}
+
+
+#[cfg(test)]
+mod inflate_limit_tests {
+    use super::{decompress_ctb, MAX_INFLATED_BYTES};
+    use std::io::Write;
+
+    /// A payload that lands exactly on the cap is within the contract
+    /// ("exceeds means exceeds"): it must load, not be refused. `take(cap)`
+    /// alone can't tell "exactly cap" from "at least cap" — the reader has
+    /// to be allowed one byte past the limit.
+    #[test]
+    fn an_inflate_of_exactly_the_cap_is_accepted() {
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder
+            .write_all(&vec![b' '; MAX_INFLATED_BYTES as usize])
+            .expect("compress");
+        let payload = encoder.finish().expect("finish");
+        let mut data = vec![b'\n'];
+        data.extend(payload);
+        let out = decompress_ctb(&data).expect("exactly the cap must be accepted");
+        assert_eq!(out.0.len() as u64, MAX_INFLATED_BYTES);
+    }
+
+    /// One byte over the cap is refused with the same limit error the
+    /// oversized bombs produce.
+    #[test]
+    fn an_inflate_one_byte_over_the_cap_is_refused() {
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder
+            .write_all(&vec![b' '; (MAX_INFLATED_BYTES + 1) as usize])
+            .expect("compress");
+        let payload = encoder.finish().expect("finish");
+        let mut data = vec![b'\n'];
+        data.extend(payload);
+        let error = decompress_ctb(&data).expect_err("one byte over must be refused");
+        assert!(error.contains("limit"), "{error}");
+    }
+
+    /// Twice the 64 MiB inflate cap the fix introduces — a payload that is
+    /// tiny compressed (spaces) but must not be inflated whole.
+    fn bomb_plaintext() -> Vec<u8> {
+        vec![b' '; 128 * 1024 * 1024]
+    }
+
+    /// A crafted CTB is a few hundred KB of zlib that expands to hundreds of
+    /// MB; `read_to_end` has no output budget, so the `Vec` grows until the
+    /// allocator fails and the process **aborts** (an abort is not a
+    /// catchable panic). Both the zlib path and the legacy raw-deflate path
+    /// must stop at the cap instead.
+    #[test]
+    fn a_zlib_bomb_is_refused_at_the_inflate_limit() {
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&bomb_plaintext()).expect("compress");
+        let payload = encoder.finish().expect("finish");
+        assert_eq!(payload[0], 0x78, "zlib header for the inflate_lenient path");
+
+        let mut data = vec![b'\n'];
+        data.extend(payload);
+        let error = decompress_ctb(&data).expect_err("zlib bomb must be refused");
+        assert!(error.contains("limit"), "{error}");
+    }
+
+    #[test]
+    fn a_legacy_deflate_bomb_is_refused_at_the_inflate_limit() {
+        let mut encoder =
+            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&bomb_plaintext()).expect("compress");
+        let payload = encoder.finish().expect("finish");
+        assert_ne!(
+            payload[0], 0x78,
+            "raw deflate takes the legacy DeflateDecoder path"
+        );
+
+        let mut data = vec![b'\n'];
+        data.extend(payload);
+        let error = decompress_ctb(&data).expect_err("deflate bomb must be refused");
+        assert!(error.contains("limit"), "{error}");
+    }
+}
+
+
+#[cfg(test)]
+mod lineweight_table_tests {
+    use super::{parse_plot_style_text, LW_TABLE};
+
+    fn parse(text: &str) -> super::PlotStyleTable {
+        parse_plot_style_text(text, "crafted.ctb".into(), false).expect("parses")
+    }
+
+    /// The table key is file-controlled: `18446744073709551615` made
+    /// `index + 1` overflow — debug builds panic, release wraps to
+    /// `resize(0)` and then panics OOB at `lineweights[usize::MAX]` — and
+    /// `500000000` resized a 2 GB table (allocation abort). Entries past
+    /// 255 are unreachable anyway: `PlotStyleEntry.lineweight` is a `u8`.
+    #[test]
+    fn oversized_lineweight_table_keys_are_ignored() {
+        let table = parse("custom_lineweight_table{\n18446744073709551615=0.5\n}\n");
+        assert_eq!(table.lineweights, LW_TABLE.to_vec());
+    }
+
+    /// In-range keys still extend the table; 256 (beyond `u8`) is ignored.
+    #[test]
+    fn in_range_lineweight_table_keys_are_kept() {
+        let table = parse("custom_lineweight_table{\n30=0.7\n}\n");
+        assert_eq!(table.lineweights.len(), 31);
+        assert_eq!(table.lineweights[30], 0.7);
+
+        let table = parse("custom_lineweight_table{\n256=0.7\n}\n");
+        assert_eq!(table.lineweights, LW_TABLE.to_vec());
+    }
+}
+
+
+#[cfg(test)]
+mod legacy_color_tests {
+    use super::parse_legacy_plot_style_text;
+
+    /// `color1` guards on `starts_with('#') && len() == 7` — a BYTE length —
+    /// then slices fixed byte offsets. `#aébé` is also 7 bytes, and byte 3
+    /// splits the second `é`: loading a crafted legacy CTB panicked with
+    /// `byte index 3 is not a char boundary`.
+    #[test]
+    fn a_multibyte_color1_value_does_not_panic() {
+        let text = "begin_plot_style\ncolor1 = #aébé\nend_plot_style\n";
+        let table = parse_legacy_plot_style_text(text, "evil.ctb".into(), false).expect("parses");
+        // Non-hex pairs stay `unwrap_or(0)` — [0, 0, 0], never a panic.
+        assert_eq!(table.aci_entries[1].color, Some([0, 0, 0]));
+    }
+
+    /// Well-formed ASCII `#RRGGBB` keeps parsing byte-for-byte.
+    #[test]
+    fn a_hex_color1_value_still_parses() {
+        let text = "begin_plot_style\ncolor1 = #A1B2C3\nend_plot_style\n";
+        let table = parse_legacy_plot_style_text(text, "ok.ctb".into(), false).expect("parses");
+        assert_eq!(table.aci_entries[1].color, Some([0xa1, 0xb2, 0xc3]));
+    }
+}

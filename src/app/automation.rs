@@ -27,6 +27,42 @@ use sha2::{Digest, Sha256};
 
 use super::OpenCADStudio;
 
+pub(crate) struct RecognitionCache {
+    key: (u64, u64, u64, Vec<String>, u64),
+    result: Value,
+}
+
+fn page_recognition(result: &Value, offset: usize, limit: usize) -> Value {
+    let limit = limit.clamp(1, 1000);
+    if result["page"].as_object().is_none() {
+        return result.clone();
+    }
+    let collections = ["components", "texts", "steps", "nodes", "reviewItems"];
+    let mut response: serde_json::Map<String, Value> = result
+        .as_object()
+        .expect("recognition result is an object")
+        .iter()
+        .filter(|(name, _)| name.as_str() != "page" && !collections.contains(&name.as_str()))
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect();
+    let mut pages = serde_json::Map::new();
+    for name in collections {
+        let Some(values) = result[name].as_array() else {
+            continue;
+        };
+        let total = values.len();
+        let items: Vec<_> = values.iter().skip(offset).take(limit).cloned().collect();
+        let next = offset.saturating_add(items.len());
+        pages.insert(
+            name.to_string(),
+            json!({ "total": total, "next_offset": (next < total).then_some(next) }),
+        );
+        response.insert(name.to_string(), json!(items));
+    }
+    response.insert("page".to_string(), Value::Object(pages));
+    Value::Object(response)
+}
+
 /// Run the headless JSON server. Default transport is stdin/stdout; with
 /// `--port <N>` it instead listens on `127.0.0.1:<N>` and serves one client at
 /// a time (the document session persists across reconnects); every socket
@@ -857,13 +893,36 @@ impl OpenCADStudio {
                 let tolerance = req["tolerance"].as_f64().unwrap_or(1.0);
                 let layers = req["layers"].as_array().map(|v| v.iter().filter_map(Value::as_str).map(str::to_owned).collect())
                     .unwrap_or_else(|| req["layer"].as_str().map(|l| vec![l.to_owned()]).unwrap_or_default());
-                let options = ocs_recognition::Options {
-                    tolerance, layers,
-                    offset: req["offset"].as_u64().unwrap_or(0).min(usize::MAX as u64) as usize,
-                    limit: req["limit"].as_u64().unwrap_or(200).clamp(1, 1000) as usize,
-                };
+                let offset = req["offset"].as_u64().unwrap_or(0).min(usize::MAX as u64) as usize;
+                let limit = req["limit"].as_u64().unwrap_or(200).clamp(1, 1000) as usize;
                 let tab = &self.tabs[self.active_tab];
-                let mut result = ocs_recognition::recognize(&tab.scene.document, &options);
+                let key = (
+                    tab.id,
+                    tab.edit_revision,
+                    tab.scene.geometry_epoch,
+                    layers.clone(),
+                    tolerance.to_bits(),
+                );
+                if self
+                    .recognition_cache
+                    .as_ref()
+                    .map_or(true, |cached| cached.key != key) {
+                    let options = ocs_recognition::Options {
+                        tolerance,
+                        layers,
+                        offset: 0,
+                        limit: 1000,
+                    };
+                    self.recognition_cache = Some(RecognitionCache {
+                        key,
+                        result: ocs_recognition::recognize_all(&tab.scene.document, &options),
+                    });
+                }
+                let mut result = page_recognition(
+                    &self.recognition_cache.as_ref().expect("recognition cache set").result,
+                    offset,
+                    limit,
+                );
                 result["document_id"] = json!(tab.id);
                 result["revision"] = json!(tab.edit_revision);
                 result["geometry_revision"] = json!(tab.scene.geometry_epoch);
@@ -1748,26 +1807,43 @@ mod tests {
         let mut app = super::OpenCADStudio::new_for_test();
         app.automation_op(r#"{"op":"new"}"#);
         app.automation_op(r#"{"op":"run","cmd":"LINE 0,0 10,0"}"#);
+        app.automation_op(r#"{"op":"run","cmd":"LINE 200,0 210,0"}"#);
         let tab = app.active_tab;
         let id = app.tabs[tab].id;
         let revision = app.tabs[tab].edit_revision;
         let epoch = app.tabs[tab].scene.geometry_epoch;
         let count = app.tabs[tab].scene.document.entities().count();
-        let result = app.automation_op(r#"{"op":"recognize","layers":["0"],"tolerance":0.01}"#);
+        let result = app.automation_op(
+            r#"{"op":"recognize","layers":["0"],"tolerance":0.01,"offset":0,"limit":1}"#,
+        );
         assert_eq!(result["ok"], true, "{result}");
         assert_eq!(result["engine"], "native");
         assert_eq!(result["document_id"], id);
         assert_eq!(result["revision"], revision);
         assert_eq!(result["geometry_revision"], epoch);
         assert_eq!(result["steps"].as_array().unwrap().len(), 1);
+        assert_eq!(result["page"]["steps"]["total"], 2);
+        assert_eq!(result["page"]["steps"]["next_offset"], 1);
+        let next = app.automation_op(
+            r#"{"op":"recognize","layers":["0"],"tolerance":0.01,"offset":1,"limit":1}"#,
+        );
+        assert_eq!(next["steps"].as_array().unwrap().len(), 1);
+        assert_eq!(next["page"]["steps"]["total"], 2);
+        assert_eq!(
+            next["page"]["steps"]["next_offset"],
+            serde_json::Value::Null
+        );
         assert_eq!(app.tabs[tab].edit_revision, revision);
         assert_eq!(app.tabs[tab].scene.geometry_epoch, epoch);
         assert_eq!(app.tabs[tab].scene.document.entities().count(), count);
         app.automation_op(r#"{"op":"run","cmd":"LINE 100,0 110,0"}"#);
-        let updated = app.automation_op(r#"{"op":"recognize","tolerance":0.01}"#);
-        assert_eq!(updated["steps"].as_array().unwrap().len(), 2);
+        let updated = app.automation_op(r#"{"op":"recognize","layers":["0"],"tolerance":0.01}"#);
+        assert_eq!(updated["steps"].as_array().unwrap().len(), 3);
         assert_ne!(updated["revision"], result["revision"]);
-        assert_eq!(app.automation_op(r#"{"op":"recognize","tolerance":0}"#)["ok"], false);
+        assert_eq!(
+            app.automation_op(r#"{"op":"recognize","tolerance":0}"#)["ok"],
+            false
+        );
     }
 
     #[test]

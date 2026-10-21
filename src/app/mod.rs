@@ -481,6 +481,8 @@ pub(crate) fn delobj_deletes_auxiliary(value: i16, creates_surface: bool) -> boo
 pub(super) struct OpenCADStudio {
     start: Instant,
     control: control::State,
+    /// Cached full native-recognition result for the active document revision.
+    pub(super) recognition_cache: Option<automation::RecognitionCache>,
     tabs: Vec<DocumentTab>,
     active_tab: usize,
     hovered_doc_tab: Option<usize>,
@@ -2502,6 +2504,12 @@ pub enum Message {
     AgentQuickPrompt(String),
     #[cfg(not(target_arch = "wasm32"))]
     AgentSend,
+    #[cfg(not(target_arch = "wasm32"))]
+    AgentPickAttachments,
+    #[cfg(not(target_arch = "wasm32"))]
+    AgentAttachmentsLoaded(Vec<Result<agent::AgentAttachment, String>>),
+    #[cfg(not(target_arch = "wasm32"))]
+    AgentRemoveAttachment(usize),
     #[cfg(not(target_arch = "wasm32"))]
     AgentStop,
     #[cfg(not(target_arch = "wasm32"))]
@@ -4712,6 +4720,7 @@ impl OpenCADStudio {
         let start_tab = DocumentTab::new_start();
         let mut app = Self {
             control: control::State::new(),
+            recognition_cache: None,
             start: Instant::now(),
             tabs: vec![start_tab],
             active_tab: 0,
@@ -5462,10 +5471,6 @@ impl OpenCADStudio {
         s.dock_open_at_default(crate::ui::dock::PanelId::Agent);
         s.main_window = Some(id);
         let open_main = open_task.map(|_| Message::Noop);
-        let check_update = Task::perform(
-            crate::io::update_check::check_for_update(),
-            Message::UpdateCheckResult,
-        );
         let focus_cmd = s.focus_cmd_input();
         // Startup configuration from the command line (see `cli`). File
         // arguments — also how the OS file association launches us when
@@ -5521,7 +5526,7 @@ impl OpenCADStudio {
         // part of the editor boot path; CAD loading owns the first frame.
         (
             s,
-            Task::batch([open_main, check_update, focus_cmd, cli_open, script]),
+            Task::batch([open_main, focus_cmd, cli_open, script]),
         )
     }
 

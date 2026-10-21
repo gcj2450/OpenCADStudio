@@ -2037,12 +2037,15 @@ impl OpenCADStudio {
             .unwrap_or(0);
         let timings = caches.timings;
         let entity_count = doc.entities().count();
-        let parser_errors_recovered = caches.read_stats.as_ref().is_some_and(|stats| {
-            stats.recovered() || stats.skipped_source_records > 0 || !stats.stream_completed
-        }) || doc
-            .notifications
-            .iter()
-            .any(|item| item.notification_type == codec::notification::NotificationType::Error);
+        // A successful normal read can contain parser diagnostics for
+        // optional/unsupported records without requiring the drawing to be
+        // repaired.  Only an explicitly failsafe read marks the document as
+        // recovered; parser failures still use the recovery prompt before
+        // this handler is reached.
+        let parser_errors_recovered = caches
+            .read_stats
+            .as_ref()
+            .is_some_and(|stats| stats.recovery_mode);
         let reference_recovered = caches
             .xrefs
             .iter()

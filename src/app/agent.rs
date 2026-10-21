@@ -6,6 +6,7 @@
 //! channels.
 
 use std::collections::HashMap;
+use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -20,10 +21,11 @@ use codex_app_server_protocol::{
     GetAccountParams, GetAccountRateLimitsResponse, GetAccountResponse, LoginAccountParams,
     LoginAccountResponse, LogoutAccountResponse, ModelListParams, ModelListResponse,
     PermissionGrantScope, PermissionsRequestApprovalResponse, RequestId, SandboxMode,
-    ServerNotification, ServerRequest, ThreadItem, ThreadListParams, ThreadListResponse,
-    ThreadResumeParams, ThreadResumeResponse, ThreadStartParams, ThreadStartResponse,
-    ToolRequestUserInputAnswer, ToolRequestUserInputParams, ToolRequestUserInputResponse,
-    TurnInterruptParams, TurnPlanUpdatedNotification, TurnStartParams, UserInput,
+    ServerNotification, ServerRequest, SkillsExtraRootsSetParams, SkillsExtraRootsSetResponse,
+    ThreadItem, ThreadListParams, ThreadListResponse, ThreadResumeParams, ThreadResumeResponse,
+    ThreadStartParams, ThreadStartResponse, ToolRequestUserInputAnswer, ToolRequestUserInputParams,
+    ToolRequestUserInputResponse, TurnInterruptParams, TurnPlanUpdatedNotification,
+    TurnStartParams, UserInput,
 };
 use iced::futures::channel::mpsc;
 use iced::futures::lock::Mutex;
@@ -31,6 +33,80 @@ use iced::futures::StreamExt;
 use iced::widget::{button, column, container, row, scrollable, text, text_editor, text_input};
 use iced::{Background, Border, Element, Fill, Task, Theme};
 use serde_json::{json, Value};
+
+#[derive(Clone, Debug)]
+pub struct AgentAttachment {
+    path: PathBuf,
+    name: String,
+    text: Option<String>,
+}
+
+impl AgentAttachment {
+    fn is_image(&self) -> bool {
+        self.text.is_none()
+    }
+}
+
+fn read_agent_attachment(path: PathBuf) -> Result<AgentAttachment, String> {
+    const MAX_BYTES: u64 = 25 * 1024 * 1024;
+    let metadata = fs::metadata(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    if metadata.len() > MAX_BYTES {
+        return Err(format!("{} exceeds the 25 MB attachment limit", path.display()));
+    }
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("attachment").to_string();
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    let bytes = fs::read(&path).map_err(|e| format!("{name}: {e}"))?;
+    let text = match ext.as_str() {
+        "png" | "jpg" | "jpeg" | "bmp" | "tif" | "tiff" | "webp" | "gif" => None,
+        "txt" | "md" | "csv" | "json" | "xml" | "yaml" | "yml" | "log" | "html" | "htm" | "rs" | "py" | "js" | "ts" => {
+            Some(String::from_utf8(bytes).map_err(|_| format!("{name} is not valid UTF-8 text"))?)
+        }
+        "docx" => {
+            let archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).map_err(|e| format!("{name}: {e}"))?;
+            let mut archive = archive;
+            let mut document = archive.by_name("word/document.xml").map_err(|e| format!("{name}: {e}"))?;
+            let mut xml = String::new();
+            std::io::Read::read_to_string(&mut document, &mut xml).map_err(|e| format!("{name}: {e}"))?;
+            let root = roxmltree::Document::parse(&xml).map_err(|e| format!("{name}: {e}"))?;
+            Some(root.descendants().filter(|n| n.is_element() && n.tag_name().name() == "t")
+                .filter_map(|n| n.text()).collect::<Vec<_>>().join(" "))
+        }
+        "xlsx" | "xls" => {
+            use calamine::{Reader, open_workbook_auto};
+            let mut workbook = open_workbook_auto(&path).map_err(|e| format!("{name}: {e}"))?;
+            let mut output = String::new();
+            for sheet in workbook.sheet_names().to_owned() {
+                if let Ok(range) = workbook.worksheet_range(&sheet) {
+                    output.push_str(&format!("\n[{sheet}]\n"));
+                    for row in range.rows() {
+                        output.push_str(&row.iter().map(ToString::to_string).collect::<Vec<_>>().join("\t"));
+                        output.push('\n');
+                    }
+                }
+            }
+            Some(output)
+        }
+        "pdf" => {
+            let pdf = hayro::hayro_syntax::Pdf::new(bytes)
+                .map_err(|e| format!("{name}: {e:?}"))?;
+            let mut output = String::new();
+            for page in 1..=pdf.pages().len() {
+                let vectors = crate::scene::model::pdf_vector::page_vectors(&path.to_string_lossy(), &page.to_string())
+                    .ok_or_else(|| format!("Could not extract text from {name}, page {page}"))?;
+                output.push_str(&format!("\n[Page {page}]\n"));
+                output.push_str(&vectors.texts.iter().map(|item| item.text.as_str()).collect::<Vec<_>>().join("\n"));
+            }
+            Some(output)
+        }
+        _ => return Err(format!("Unsupported attachment type: {name}")),
+    };
+    if let Some(content) = &text {
+        if content.len() > 500_000 {
+            return Err(format!("Extracted text from {name} exceeds 500 KB"));
+        }
+    }
+    Ok(AgentAttachment { path, name, text })
+}
 
 use super::{Message, OpenCADStudio};
 
@@ -191,6 +267,7 @@ enum AgentCommand {
     CancelLogin(String),
     Prompt {
         text: String,
+        attachments: Vec<AgentAttachment>,
         cwd: PathBuf,
         model: Option<String>,
         effort: Option<String>,
@@ -220,6 +297,7 @@ pub(super) struct AgentPanelState {
     usage: Option<GetAccountRateLimitsResponse>,
     polling: bool,
     pub input: String,
+    pub(super) attachments: Vec<AgentAttachment>,
     pub(super) model_input: String,
     pub(super) selected_effort: String,
     messages: Vec<ChatMessage>,
@@ -254,6 +332,7 @@ impl Default for AgentPanelState {
             usage: None,
             polling: false,
             input: String::new(),
+            attachments: Vec::new(),
             model_input: String::new(),
             selected_effort: "medium".to_string(),
             messages: Vec::new(),
@@ -645,6 +724,13 @@ impl AgentPanelState {
             );
         }
 
+        let mut attachment_rows = column![].spacing(3);
+        for (index, attachment) in self.attachments.iter().enumerate() {
+            attachment_rows = attachment_rows.push(row![
+                text(attachment.name.as_str()).size(10).width(Fill),
+                button(text("Remove").size(9)).on_press(Message::AgentRemoveAttachment(index)).padding([3, 6]),
+            ].spacing(4));
+        }
         let composer = row![
             text_input("Ask the CAD agent…", &self.input)
                 .on_input(Message::AgentInput)
@@ -652,6 +738,9 @@ impl AgentPanelState {
                 .size(12)
                 .padding(8)
                 .width(Fill),
+            button(text("Attach").size(10))
+                .on_press_maybe((!self.busy && self.attachments.len() < 10).then_some(Message::AgentPickAttachments))
+                .padding([7, 8]),
             if self.busy {
                 button(text("Stop").size(11))
                     .on_press(Message::AgentStop)
@@ -683,6 +772,7 @@ impl AgentPanelState {
             scrollable(container(transcript).width(Fill).padding([4, 8]))
                 .height(Fill)
                 .width(Fill),
+            container(attachment_rows).width(Fill).padding([5, 8]),
             container(composer).width(Fill).padding([5, 8]),
         ]
         .spacing(4)
@@ -922,9 +1012,16 @@ impl OpenCADStudio {
 
     pub(super) fn send_agent_prompt(&mut self) -> Task<Message> {
         let prompt = self.agent.input.trim().to_string();
-        if prompt.is_empty() || self.agent.busy {
+        if (prompt.is_empty() && self.agent.attachments.is_empty()) || self.agent.busy {
             return Task::none();
         }
+        let attachments = std::mem::take(&mut self.agent.attachments);
+        let display_prompt = if attachments.is_empty() {
+            prompt.clone()
+        } else {
+            let names = attachments.iter().map(|item| item.name.as_str()).collect::<Vec<_>>().join(", ");
+            if prompt.is_empty() { format!("Attachments: {names}") } else { format!("{prompt}\n\nAttachments: {names}") }
+        };
         self.agent.start_service();
         // Empty model means the runtime config, including custom providers.
         self.agent
@@ -934,7 +1031,7 @@ impl OpenCADStudio {
         self.agent.plan = None;
         self.agent
             .messages
-            .push(ChatMessage::new("user", prompt.clone()));
+            .push(ChatMessage::new("user", display_prompt));
         self.agent
             .messages
             .push(ChatMessage::new("assistant", String::new()));
@@ -944,6 +1041,7 @@ impl OpenCADStudio {
         let cwd = self.agent.active_cwd(self);
         if !self.agent.send_command(AgentCommand::Prompt {
             text: prompt,
+            attachments,
             cwd,
             model: self.agent.selected_model(),
             effort: self.agent.selected_effort(),
@@ -953,6 +1051,33 @@ impl OpenCADStudio {
             return Task::none();
         }
         self.agent.poll_task()
+    }
+
+    pub(super) fn pick_agent_attachments(&self) -> Task<Message> {
+        Task::perform(async {
+            let files = crate::sys::file_dialog()
+                .set_title("Attach files to the CAD agent")
+                .add_filter("Documents, images, and text", &["png", "jpg", "jpeg", "bmp", "tif", "tiff", "webp", "gif", "txt", "md", "csv", "json", "xml", "yaml", "yml", "log", "html", "htm", "rs", "py", "js", "ts", "docx", "xlsx", "xls", "pdf"])
+                .pick_files().await;
+            let mut results = Vec::new();
+            if let Some(files) = files {
+                for handle in files.into_iter().take(10) {
+                    results.push(read_agent_attachment(crate::sys::handle_path(&handle)));
+                }
+            }
+            results
+        }, Message::AgentAttachmentsLoaded)
+    }
+
+    pub(super) fn agent_attachments_loaded(&mut self, results: Vec<Result<AgentAttachment, String>>) -> Task<Message> {
+        for result in results {
+            match result {
+                Ok(attachment) if self.agent.attachments.len() < 10 => self.agent.attachments.push(attachment),
+                Ok(_) => self.agent.status = "The agent supports up to 10 attachments per message".into(),
+                Err(error) => self.agent.status = error,
+            }
+        }
+        Task::none()
     }
 
     pub(super) fn agent_quick_prompt(&mut self, prompt: String) -> Task<Message> {
@@ -1671,7 +1796,22 @@ fn embedded_tool_definitions() -> Value {
 }
 
 fn embedded_instructions() -> &'static str {
-    "You are the native CAD drawing and visual-inspection agent inside OpenCADStudio. Operate on the active in-process drawing only through the supplied OpenCADStudio tools. Start with ocs_sessions, then read the active document state using ocs_read and preserve its session, document, and revision context. For arbitrary database inspection, use ocs_read op records without a collection to discover available collections, then record_schema to discover fields, then records with collection, handles, where and paths. These operations read the active in-memory CadDocument, including unsaved edits; they do not need a file path, export, Python or another CAD application. Follow next_offset until null and retain source handles. Read entities, objects, block_records, layers, styles, header and metadata as needed. For equipment, inspect Insert attributes and follow block_record entity_handles into block definitions; query geometry is a summary and records returns complete serialized properties. Do not equate every block with equipment or a bounded recognition pass with a complete equipment count. Parser-unsupported data cannot be recovered by a tool that only reads parsed records. Call these supplied native tools directly, without a JavaScript exec wrapper. For structure recognition, call ocs_read op recognize first with the relevant centerline layers and a suitable drawing-unit tolerance; it reads the live CAD database natively, returns source handles and bounded topology, and places unsupported or ambiguous cases in reviewItems. Follow page cursors and complete; supported-pass completion does not mean complete domain understanding. Use viewport capture when visual context matters; distinguish world coordinates from pixels and state uncertainty. Discover registered CAD commands using ocs_read op commands before running one through ocs_execute op run; follow state.command.accepts, options, and input_example while a command waits for input. Use entity_schema and validate before structured creation or edits. Make changes only when requested, wait for completion, and verify them by reading the resulting drawing or capturing the viewport. After a timeout, query the existing operation and never replay a mutation with a new request_id. Native recognize does not start Python or export DXF. A domain plugin command is available only when the command manifest advertises it. Read workflow guides on demand with ocs_read op guide."
+    "You are the native CAD drawing and visual-inspection agent inside OpenCADStudio. Operate on the active in-process drawing through supplied OpenCADStudio tools. Start each new task with ocs_sessions and one ocs_read state call; preserve session_id, document_id and revision. These tools read the live in-memory CadDocument, including unsaved edits. Do not reopen or reparse the DWG, export it, or reread unchanged collections. Read only the data needed for the question. For broad inventory, discover record collections once, then page each required collection once while retaining handles and the returned revision; do not repeat a collection read during the same analysis. Native recognition results are cached for the current document and geometry revision, so use its page cursors without restarting analysis; after a drawing edit, read state and recognize the new revision. Recognition is a bounded structural pass, not a complete domain interpretation: inspect relevant layers, block attributes/definitions, text labels and viewport evidence, and report unsupported/ambiguous cases from reviewItems. Use viewport capture when visual context matters; distinguish world coordinates from pixels and state uncertainty. Discover CAD commands before running them; follow state.command.accepts/options/input_example for interactive commands. Use entity_schema and validate before structured edits. Modify only when requested and verify changes. After a timeout query the existing operation, never replay a mutation with a new request_id. Use the bundled CAD skills for design and quality guidance, but OpenCADStudio's native tools are authoritative for reading or editing this drawing; do not switch to AutoCAD COM, AutoLISP, Python, export-based parsing or external CAD applications."
+}
+
+fn bundled_skills_root() -> Option<PathBuf> {
+    if let Some(executable_root) = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(|parent| parent.join("skills")))
+    {
+        if executable_root.is_dir() {
+            return Some(executable_root);
+        }
+    }
+    let source_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()?
+        .join("cad-skills-master");
+    source_root.is_dir().then_some(source_root)
 }
 
 async fn run_agent(
@@ -1695,12 +1835,31 @@ async fn run_agent(
         }
     };
     let request_handle = client.request_handle();
+    let mut request_serial = 1_u64;
+    if let Some(root) = bundled_skills_root() {
+        let registered = std::fs::canonicalize(&root).ok().and_then(|root| {
+            serde_json::from_value::<SkillsExtraRootsSetParams>(json!({
+                "extraRoots": [root]
+            }))
+            .ok()
+        });
+        if let Some(params) = registered {
+            if let Err(error) = client
+                .request_typed::<SkillsExtraRootsSetResponse>(ClientRequest::SkillsExtraRootsSet {
+                    request_id: next_request_id(&mut request_serial),
+                    params,
+                })
+                .await
+            {
+                log::warn!("Could not register bundled CAD skills: {error}");
+            }
+        }
+    }
     let _ = events.unbounded_send(AgentEvent::Status(
         "Embedded Codex runtime connected".to_string(),
     ));
     let mut thread_id: Option<String> = None;
     let mut turn_id: Option<String> = None;
-    let mut request_serial = 1_u64;
 
     loop {
         tokio::select! {
@@ -1709,7 +1868,7 @@ async fn run_agent(
                     Some(command @ (AgentCommand::Account(_) | AgentCommand::LoginApiKey(_) | AgentCommand::CancelLogin(_))) => {
                         handle_account_command(&client, command, &mut request_serial, &events).await;
                     }
-                    Some(AgentCommand::Prompt { text, cwd, model, effort }) => {
+                    Some(AgentCommand::Prompt { text, attachments, cwd, model, effort }) => {
                         if thread_id.is_none() {
                             let params = ThreadStartParams {
                                 cwd: Some(cwd.to_string_lossy().to_string()),
@@ -1737,12 +1896,27 @@ async fn run_agent(
                             }
                         }
                         let Some(thread) = thread_id.clone() else { continue; };
+                        let mut input = Vec::new();
+                        if !text.is_empty() {
+                            input.push(json!({ "type": "text", "text": text, "textElements": [] }));
+                        }
+                        for attachment in attachments {
+                            if attachment.is_image() {
+                                input.push(json!({ "type": "localImage", "path": attachment.path }));
+                            } else if let Some(content) = attachment.text {
+                                input.push(json!({
+                                    "type": "text",
+                                    "text": format!("\n\n--- Attachment: {} ---\n{}\n--- End attachment ---", attachment.name, content),
+                                    "textElements": []
+                                }));
+                            }
+                        }
                         let params = serde_json::from_value::<TurnStartParams>(json!({
                             "threadId": thread,
                             "cwd": cwd,
                             "model": model,
                             "effort": effort,
-                            "input": [{ "type": "text", "text": text, "textElements": [] }]
+                            "input": input
                         }));
                         let params = match params {
                             Ok(params) => params,

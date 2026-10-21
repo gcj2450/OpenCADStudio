@@ -441,15 +441,14 @@ async fn open_path_with_phase_attempt(
                     let t_purge = Instant::now();
                     let dropped = purge_corrupt_entities(&mut doc);
                     let purge_ms = t_purge.elapsed().as_millis() as u32;
-                    if matches!(attempt, OpenAttempt::Strict) && dropped > 0 {
-                        return Err(OpenAttemptFailure {
-                            message: format!(
-                                "normal read found {dropped} structurally invalid drawing records"
-                            ),
-                            read_stats: Some(read_stats),
-                            recoverable: true,
-                        });
-                    }
+                    // A normal read may still contain a small number of
+                    // malformed records.  The guard above has already
+                    // removed records that could crash geometry preparation;
+                    // keep the usable document open and report the count in
+                    // the open summary instead of forcing every such file
+                    // through the recovery modal.  Actual parser failures
+                    // still return through `OpenAttemptFailure` and retain
+                    // the explicit recovery action.
                     // Before the geometry is prepared below: repairing the
                     // drawing's stripped catalog linetypes after it would leave
                     // the first view drawn without their shapes. None is added:
@@ -1070,10 +1069,25 @@ pub(crate) fn load_file_with_progress(
 /// fast path in [`read_dwg_path`].
 #[cfg(not(target_arch = "wasm32"))]
 pub fn load_path_finalized(path: &Path) -> Result<(CadDocument, usize), String> {
-    let outcome = read_file_attempt(path, None, false).map_err(|failure| failure.message)?;
-    if !outcome.stats.has_usable_drawing_data() {
-        return Err("initial read returned no source drawing records".to_string());
-    }
+    let outcome = match read_file_attempt(path, None, false) {
+        Ok(outcome) if outcome.stats.has_usable_drawing_data() => outcome,
+        initial => {
+            let initial_error = match &initial {
+                Ok(_) => "initial read returned no usable drawing records".to_string(),
+                Err(error) => format!("initial read failed: {}", error.message),
+            };
+            let mut recovered = read_file_attempt(path, None, true).map_err(|error| {
+                format!("{initial_error}; tolerant read failed: {}", error.message)
+            })?;
+            if !recovered.stats.has_usable_drawing_data() {
+                return Err(format!(
+                    "{initial_error}; tolerant read returned no usable drawing records"
+                ));
+            }
+            recovered.stats.recovery_mode = false;
+            recovered
+        }
+    };
     let mut outcome = finalize_loaded_outcome(path, outcome)?;
     let dropped = purge_corrupt_entities(&mut outcome.document);
     Ok((outcome.document, dropped))
@@ -1087,37 +1101,62 @@ fn load_file_for_open(
 ) -> Result<codec::ReadOutcome, OpenAttemptFailure> {
     let outcome = match attempt {
         OpenAttempt::Strict => {
-            let outcome =
-                read_file_attempt(path, progress, false).map_err(|failure| OpenAttemptFailure {
-                    message: failure.message,
-                    read_stats: None,
-                    recoverable: failure.recoverable,
-                })?;
-            if !outcome.stats.has_usable_drawing_data() {
-                return Err(OpenAttemptFailure {
-                    message: "initial read returned no source drawing records".to_string(),
-                    read_stats: Some(outcome.stats),
-                    recoverable: true,
-                });
-            }
-            if outcome.stats.recovered()
-                || outcome.stats.skipped_source_records > 0
-                || !outcome.stats.stream_completed
-            {
-                let message = outcome
-                    .stats
-                    .diagnostics
-                    .first()
-                    .map(|diagnostic| diagnostic.message.clone())
-                    .unwrap_or_else(|| {
-                        "normal read detected recoverable drawing errors".to_string()
-                    });
-                return Err(OpenAttemptFailure {
-                    message,
-                    read_stats: Some(outcome.stats),
-                    recoverable: true,
-                });
-            }
+            let initial = read_file_attempt(path, progress.clone(), false);
+            let outcome = match initial {
+                Ok(outcome) if outcome.stats.has_usable_drawing_data() => outcome,
+                Ok(outcome) => {
+                    let initial_error =
+                        "initial read returned no usable drawing records".to_string();
+                    match read_file_attempt(path, progress, true) {
+                        Ok(recovered) if recovered.stats.has_usable_drawing_data() => recovered,
+                        Ok(recovered) => {
+                            return Err(OpenAttemptFailure {
+                                message: initial_error,
+                                read_stats: Some(recovered.stats),
+                                recoverable: true,
+                            });
+                        }
+                        Err(recovery_error) => {
+                            return Err(OpenAttemptFailure {
+                                message: format!(
+                                    "{initial_error}; tolerant read failed: {}",
+                                    recovery_error.message
+                                ),
+                                read_stats: Some(outcome.stats),
+                                recoverable: true,
+                            });
+                        }
+                    }
+                }
+                Err(initial_error) => match read_file_attempt(path, progress, true) {
+                    Ok(recovered) if recovered.stats.has_usable_drawing_data() => recovered,
+                    Ok(recovered) => {
+                        return Err(OpenAttemptFailure {
+                            message: format!(
+                                "initial read failed: {}; tolerant read returned no usable drawing records",
+                                initial_error.message
+                            ),
+                            read_stats: Some(recovered.stats),
+                            recoverable: true,
+                        });
+                    }
+                    Err(recovery_error) => {
+                        return Err(OpenAttemptFailure {
+                            message: format!(
+                                "initial read failed: {}; tolerant read failed: {}",
+                                initial_error.message, recovery_error.message
+                            ),
+                            read_stats: None,
+                            recoverable: initial_error.recoverable,
+                        });
+                    }
+                },
+            };
+            // The tolerant pass is an automatic compatibility fallback for a
+            // usable drawing. It must not turn a normal open into a recovery
+            // report or force a save-as workflow.
+            let mut outcome = outcome;
+            outcome.stats.recovery_mode = false;
             outcome
         }
         OpenAttempt::Recovery(initial_error, initial_stats) => {
@@ -1310,13 +1349,25 @@ fn read_dwg_path(
                     if let Some(progress) = &progress {
                         reader.set_progress_callback(progress.clone());
                     }
-                    match reader.read_with_stats() {
+                    let read_result = if failsafe {
+                        reader
+                            .recover()
+                            .map(|recovered| {
+                                codec::ReadOutcome::new(recovered.document, recovered.stats)
+                            })
+                    } else {
+                        reader.read_with_stats()
+                    };
+                    match read_result {
                         Ok(outcome) => return Ok(outcome),
-                        // The file shrank or became unreadable mid-parse;
-                        // retry from a snapshot instead of reporting a bare
-                        // I/O error.
-                        Err(codec::DxfError::Io(_)) => {}
-                        Err(error) => return Err(ReaderFailure::from_reader(error)),
+                        // A mapped file can fail during parsing for reasons
+                        // that are not reported as a plain I/O error (for
+                        // example a damaged page or a cloud placeholder that
+                        // faults while the recovery reader is scanning it).
+                        // Retry every mmap read failure from a stable byte
+                        // snapshot; this is also what lets the repair action
+                        // use the same input as the initial open attempt.
+                        Err(_) => {}
                     }
                 }
                 // Locked or unmappable: the snapshot read surfaces the real
@@ -1333,7 +1384,14 @@ fn read_dwg_path(
         if let Some(progress) = progress {
             reader.set_progress_callback(progress);
         }
-        reader.read_with_stats().map_err(ReaderFailure::from_reader)
+        let result = if failsafe {
+            reader
+                .recover()
+                .map(|recovered| codec::ReadOutcome::new(recovered.document, recovered.stats))
+        } else {
+            reader.read_with_stats()
+        };
+        result.map_err(ReaderFailure::from_reader)
     }
     #[cfg(target_arch = "wasm32")]
     {
@@ -1406,14 +1464,20 @@ fn read_drawing_snapshot(path: &Path) -> std::io::Result<Vec<u8>> {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn read_dxf_path(path: &Path, failsafe: bool) -> Result<codec::ReadOutcome, ReaderFailure> {
-    DxfReader::from_file(path)
+    let reader = DxfReader::from_file(path)
         .map_err(ReaderFailure::from_reader)?
         .with_configuration(DxfReaderConfiguration {
             failsafe,
             ..DxfReaderConfiguration::default()
-        })
-        .read_with_stats()
-        .map_err(ReaderFailure::from_reader)
+        });
+    let result = if failsafe {
+        reader
+            .recover()
+            .map(|recovered| codec::ReadOutcome::new(recovered.document, recovered.stats))
+    } else {
+        reader.read_with_stats()
+    };
+    result.map_err(ReaderFailure::from_reader)
 }
 
 /// Canonicalise legacy block-table origins to the post-R10 representation:
@@ -3381,6 +3445,7 @@ mod corrupt_guard_tests {
         let i = codec::entities::Insert::new("BLOCK", Vector3::ZERO);
         assert!(!is_entity_corrupt(&EntityType::Insert(i)));
     }
+
 }
 
 #[cfg(test)]

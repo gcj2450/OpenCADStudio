@@ -279,6 +279,17 @@ impl Reader<'_> {
 /// `complete` means the supported structural pass stayed within its budget,
 /// never that every domain-specific object has been understood.
 pub fn recognize(doc: &CadDocument, options: &Options) -> Value {
+    recognize_impl(doc, options, true)
+}
+
+/// Run recognition once and return every result collection without paging.
+/// Hosts can retain this value for the current document revision and serve
+/// follow-up pages without rebuilding topology.
+pub fn recognize_all(doc: &CadDocument, options: &Options) -> Value {
+    recognize_impl(doc, options, false)
+}
+
+fn recognize_impl(doc: &CadDocument, options: &Options, paged: bool) -> Value {
     if !options.tolerance.is_finite() || options.tolerance < 1e-9 {
         return json!({"ok":false,"error":"recognize: tolerance must be a finite drawing-unit distance of at least 1e-9"});
     }
@@ -362,12 +373,20 @@ pub fn recognize(doc: &CadDocument, options: &Options) -> Value {
         ("reviewItems", reader.review),
     ] {
         let total = values.len();
-        let page: Vec<_> = values
-            .into_iter()
-            .skip(options.offset)
-            .take(options.limit.clamp(1, 1000))
-            .collect();
-        let next = options.offset.saturating_add(page.len());
+        let page: Vec<_> = if paged {
+            values
+                .into_iter()
+                .skip(options.offset)
+                .take(options.limit.clamp(1, 1000))
+                .collect()
+        } else {
+            values
+        };
+        let next = if paged {
+            options.offset.saturating_add(page.len())
+        } else {
+            total
+        };
         result["page"][name] = json!({"total":total,"next_offset":(next<total).then_some(next)});
         result[name] = json!(page);
     }
