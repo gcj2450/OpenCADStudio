@@ -1332,8 +1332,7 @@ impl OpenCADStudio {
             const SELECTION_DRAG_MIN_PX2: f32 = 12.0 * 12.0;
             const SELECTION_DRAG_FAST_PX2: f32 = 24.0 * 24.0;
             let dragged = dist2 > SELECTION_DRAG_MIN_PX2
-                && (elapsed_ms >= POLY_START_DELAY_MS
-                    || dist2 > SELECTION_DRAG_FAST_PX2);
+                && (elapsed_ms >= POLY_START_DELAY_MS || dist2 > SELECTION_DRAG_FAST_PX2);
             if !sel.input.left_dragging && dragged {
                 sel.input.left_dragging = true;
                 if self.pick_drag_rect {
@@ -1852,11 +1851,11 @@ impl OpenCADStudio {
             if axis_lock.is_none()
                 && otrack_hit.is_none()
                 && !snap_hit.is_some_and(|s| {
-                        !matches!(
-                            s.snap_type,
-                            crate::snap::SnapType::Grid | crate::snap::SnapType::Extension
-                        )
-                    })
+                    !matches!(
+                        s.snap_type,
+                        crate::snap::SnapType::Grid | crate::snap::SnapType::Extension
+                    )
+                })
             {
                 let base = grip.origin_world;
                 let ucs_xf = self.tabs[i].ucs_xform();
@@ -2694,8 +2693,7 @@ impl OpenCADStudio {
                         !self.tabs[i].snap_result.is_some_and(|s| {
                             !matches!(
                                 s.snap_type,
-                                crate::snap::SnapType::Grid
-                                    | crate::snap::SnapType::Extension
+                                crate::snap::SnapType::Grid | crate::snap::SnapType::Extension
                             )
                         })
                     }) {

@@ -332,7 +332,9 @@ impl OpenCADStudio {
                     let _ = scene.document.layers.add(layer_record);
                 }
             }
-            use crate::app::command_driver::clipboard::{eed_app_map, merge_app_ids, remap_eed_apps};
+            use crate::app::command_driver::clipboard::{
+                eed_app_map, merge_app_ids, remap_eed_apps,
+            };
             merge_app_ids(&mut scene.document, &deps);
             let apps = eed_app_map(&scene.document, &deps);
             for mut entity in cloned {

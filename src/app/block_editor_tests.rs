@@ -2154,7 +2154,7 @@ fn visibility_parameter_placement_rejects_duplicates_stale_context_and_nonfinite
 
 #[test]
 fn visibility_parameter_placement_preserves_an_opaque_authoring_graph() {
-    use codec::objects::{DynamicBlockObject, DynamicBlockData, ObjectType};
+    use codec::objects::{DynamicBlockData, DynamicBlockObject, ObjectType};
     let (mut app, reference) = fixture();
     let i = app.active_tab;
     let doc = &mut app.tabs[i].scene.document;

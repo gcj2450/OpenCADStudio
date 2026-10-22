@@ -1442,8 +1442,7 @@ impl OpenCADStudio {
                     .get(&self.ds_dimtxsty)
                     .map(|style| style.height)
                     .filter(|height| *height > 0.0);
-                let blk_name =
-                    |h: codec::types::Handle| crate::entities::arrowheads::label(doc, h);
+                let blk_name = |h: codec::types::Handle| crate::entities::arrowheads::label(doc, h);
                 let lt_name = |h: codec::types::Handle| -> String {
                     if h.is_null() {
                         "ByBlock".to_string()

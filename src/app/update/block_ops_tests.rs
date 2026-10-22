@@ -224,7 +224,9 @@ fn fixture_dimension_reference(app: &mut OpenCADStudio) -> String {
     dimension.base.style_name = "BO_ARROWSTYLE".to_string();
     app.tabs[i]
         .scene
-        .add_entity(EntityType::Dimension(Box::new(Dimension::Aligned(dimension))));
+        .add_entity(EntityType::Dimension(Box::new(Dimension::Aligned(
+            dimension,
+        ))));
     name.to_string()
 }
 
@@ -244,7 +246,9 @@ fn fixture_dimension_name_reference(app: &mut OpenCADStudio) -> String {
     dimension.base.style_name = "BO_ARROWNAMESTYLE".to_string();
     app.tabs[i]
         .scene
-        .add_entity(EntityType::Dimension(Box::new(Dimension::Aligned(dimension))));
+        .add_entity(EntityType::Dimension(Box::new(Dimension::Aligned(
+            dimension,
+        ))));
     name.to_string()
 }
 

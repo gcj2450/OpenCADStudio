@@ -1594,8 +1594,9 @@ impl OpenCADStudio {
         // text derives its paper height from the two endpoints,
         // while annotative text exposes that paper height and a
         // separate calculated model height.
-        if let Some(factor) =
-            self.tabs[i].scene.annotative_text_height_factor(entity.common().handle)
+        if let Some(factor) = self.tabs[i]
+            .scene
+            .annotative_text_height_factor(entity.common().handle)
         {
             // Annotative text stores the model height of its default scale;
             // the Height row edits the paper height at the displayed scale.
@@ -1626,7 +1627,10 @@ impl OpenCADStudio {
             for section in sections.iter_mut() {
                 if let Some(row) = section.props.iter_mut().find(|row| row.field == "height") {
                     let editable = !aligned
-                        && !matches!(row.value, crate::scene::model::object::PropValue::ReadOnly(_));
+                        && !matches!(
+                            row.value,
+                            crate::scene::model::object::PropValue::ReadOnly(_)
+                        );
                     *row = crate::entities::common::num_prop(
                         t!("Paper text height").as_ref(),
                         "height",

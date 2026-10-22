@@ -891,8 +891,20 @@ impl OpenCADStudio {
             "entities" => self.entity_summary(),
             "recognize" => {
                 let tolerance = req["tolerance"].as_f64().unwrap_or(1.0);
-                let layers = req["layers"].as_array().map(|v| v.iter().filter_map(Value::as_str).map(str::to_owned).collect())
-                    .unwrap_or_else(|| req["layer"].as_str().map(|l| vec![l.to_owned()]).unwrap_or_default());
+                let layers = req["layers"]
+                    .as_array()
+                    .map(|v| {
+                        v.iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_owned)
+                            .collect()
+                    })
+                    .unwrap_or_else(|| {
+                        req["layer"]
+                            .as_str()
+                            .map(|l| vec![l.to_owned()])
+                            .unwrap_or_default()
+                    });
                 let offset = req["offset"].as_u64().unwrap_or(0).min(usize::MAX as u64) as usize;
                 let limit = req["limit"].as_u64().unwrap_or(200).clamp(1, 1000) as usize;
                 let tab = &self.tabs[self.active_tab];
@@ -906,7 +918,8 @@ impl OpenCADStudio {
                 if self
                     .recognition_cache
                     .as_ref()
-                    .map_or(true, |cached| cached.key != key) {
+                    .map_or(true, |cached| cached.key != key)
+                {
                     let options = ocs_recognition::Options {
                         tolerance,
                         layers,
@@ -919,10 +932,50 @@ impl OpenCADStudio {
                     });
                 }
                 let mut result = page_recognition(
-                    &self.recognition_cache.as_ref().expect("recognition cache set").result,
+                    &self
+                        .recognition_cache
+                        .as_ref()
+                        .expect("recognition cache set")
+                        .result,
                     offset,
                     limit,
                 );
+                result["document_id"] = json!(tab.id);
+                result["revision"] = json!(tab.edit_revision);
+                result["geometry_revision"] = json!(tab.scene.geometry_epoch);
+                result
+            }
+            "duct_layers" => {
+                let tab = &self.tabs[self.active_tab];
+                let mut result = ocs_recognition::classify_duct_layers(&tab.scene.document);
+                result["document_id"] = json!(tab.id);
+                result["revision"] = json!(tab.edit_revision);
+                result["geometry_revision"] = json!(tab.scene.geometry_epoch);
+                result
+            }
+            "duct_recognize" => {
+                let tab = &self.tabs[self.active_tab];
+                let strings = |name: &str| {
+                    req[name]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>()
+                };
+                let result = ocs_recognition::recognize_duct(
+                    &tab.scene.document,
+                    &ocs_recognition::DuctOptions {
+                        pipe_layers: strings("pipe_layers"),
+                        centerline_layers: strings("centerline_layers"),
+                        annotation_layers: strings("annotation_layers"),
+                        tolerance: req["tolerance"].as_f64().unwrap_or(1.0),
+                        corrections: req.get("corrections").cloned().unwrap_or_else(|| json!([])),
+                        finalize: req["finalize"].as_bool().unwrap_or(false),
+                    },
+                );
+                let mut result = result;
                 result["document_id"] = json!(tab.id);
                 result["revision"] = json!(tab.edit_revision);
                 result["geometry_revision"] = json!(tab.scene.geometry_epoch);
@@ -2251,7 +2304,9 @@ mod tests {
         dimension.definition_point = Vector3::new(0.0, 5.0, 0.0);
         dimension.base.text_middle_point = Vector3::new(5.0, 5.0, 0.0);
         document
-            .add_entity(EntityType::Dimension(Box::new(Dimension::Linear(dimension))))
+            .add_entity(EntityType::Dimension(Box::new(Dimension::Linear(
+                dimension,
+            ))))
             .unwrap();
         crate::modules::draw::modify::explode::bake_dimension_blocks(&mut document);
 
@@ -2274,7 +2329,9 @@ mod tests {
         dimension.base.text_middle_point = Vector3::new(5.0, 5.0, 0.0);
         app.tabs[app.active_tab]
             .scene
-            .add_entity(EntityType::Dimension(Box::new(Dimension::Linear(dimension))));
+            .add_entity(EntityType::Dimension(Box::new(Dimension::Linear(
+                dimension,
+            ))));
         let path = std::env::temp_dir().join(format!(
             "ocs_verified_dimension_{}_{}.dwg",
             std::process::id(),
@@ -2312,7 +2369,9 @@ mod tests {
         let i = app.active_tab;
         app.tabs[i]
             .scene
-            .add_entity(EntityType::Dimension(Box::new(Dimension::Linear(dimension))));
+            .add_entity(EntityType::Dimension(Box::new(Dimension::Linear(
+                dimension,
+            ))));
         let path = std::env::temp_dir().join(format!(
             "ocs_verified_dimension_follow_up_{}_{}.dwg",
             std::process::id(),
@@ -3764,7 +3823,9 @@ mod tests {
         let mut dst_mtext = MText::new();
         dst_mtext.value = "DSTM".into();
         dst_mtext.height = 2.0;
-        let dst_mtext_h = app.tabs[i].scene.add_entity(EntityType::MText(Box::new(dst_mtext)));
+        let dst_mtext_h = app.tabs[i]
+            .scene
+            .add_entity(EntityType::MText(Box::new(dst_mtext)));
 
         // Drive the interactive command exactly as the viewport does:
         // phase 1 source pick, phase 2 destination selection.

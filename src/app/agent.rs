@@ -34,6 +34,262 @@ use iced::widget::{button, column, container, row, scrollable, text, text_editor
 use iced::{Background, Border, Element, Fill, Task, Theme};
 use serde_json::{json, Value};
 
+const MAX_DUCT_TOOL_ITEMS: usize = 300;
+
+fn duct_tool_layers(classification: &Value, property: &str, supplied: &Value) -> Vec<String> {
+    let mut layers: Vec<String> = if let Some(values) = supplied.as_array() {
+        values
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect()
+    } else {
+        classification["systems"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|system| system[property].as_array().into_iter().flatten())
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect()
+    };
+    layers.sort_by_key(|layer| layer.to_ascii_lowercase());
+    layers.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+    layers
+}
+
+fn duct_annotation_layer_evidence(
+    doc: &codec::CadDocument,
+    candidate_layers: &std::collections::HashSet<String>,
+) -> Value {
+    let mut layers = std::collections::BTreeMap::<String, Value>::new();
+    for entity in doc.entities() {
+        let layer = &entity.common().layer;
+        let kind = entity.as_entity().entity_type();
+        let text = match entity {
+            codec::EntityType::Text(value) => Some(value.value.as_str()),
+            codec::EntityType::MText(value) => Some(value.value.as_str()),
+            codec::EntityType::Dimension(value) => value.base().text_override(),
+            codec::EntityType::MultiLeader(value) => value.text(),
+            _ => None,
+        };
+        let upper = layer.to_ascii_uppercase();
+        let named_annotation = ["DIM", "ANNOT", "TEXT", "NOTE", "标注", "尺寸"]
+            .iter()
+            .any(|term| upper.contains(term));
+        let is_candidate = candidate_layers.contains(&layer.to_ascii_lowercase());
+        if !named_annotation && !is_candidate {
+            continue;
+        }
+        let entry = layers
+            .entry(layer.clone())
+            .or_insert_with(|| json!({"entityCount":0,"entityTypeCounts":{},"textSamples":[]}));
+        entry["entityCount"] = json!(entry["entityCount"].as_u64().unwrap_or(0) + 1);
+        let type_count = entry["entityTypeCounts"][kind].as_u64().unwrap_or(0) + 1;
+        entry["entityTypeCounts"][kind] = json!(type_count);
+        if let Some(text) = text.map(str::trim).filter(|text| !text.is_empty()) {
+            let samples = entry["textSamples"].as_array_mut().expect("sample array");
+            if samples.len() < 5 {
+                samples.push(json!({
+                    "entityType":kind,
+                    "handle":format!("{:X}", entity.common().handle.value()),
+                    "text":text.chars().take(160).collect::<String>()
+                }));
+            }
+        }
+    }
+    json!(layers
+        .into_iter()
+        .take(100)
+        .collect::<std::collections::BTreeMap<_, _>>())
+}
+
+fn duct_agent_tool_result(doc: &codec::CadDocument, arguments: &Value) -> Value {
+    let classification = ocs_recognition::classify_duct_layers(doc);
+    let pipe_layers: Vec<String> = arguments["pipe_layers"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect();
+    let centerline_layers = duct_tool_layers(
+        &classification,
+        "centerlineLayers",
+        &arguments["centerline_layers"],
+    );
+    let annotation_layers = duct_tool_layers(
+        &classification,
+        "annotationLayers",
+        &arguments["annotation_layers"],
+    );
+
+    let layer_set: std::collections::HashSet<String> = pipe_layers
+        .iter()
+        .chain(&centerline_layers)
+        .chain(&annotation_layers)
+        .map(|layer| layer.to_ascii_lowercase())
+        .collect();
+    let mut layer_counts = std::collections::BTreeMap::<String, usize>::new();
+    for entity in doc.entities() {
+        let layer = &entity.common().layer;
+        if layer_set.contains(&layer.to_ascii_lowercase()) {
+            *layer_counts.entry(layer.clone()).or_default() += 1;
+        }
+    }
+
+    if pipe_layers.is_empty() {
+        let duct_terms = [
+            "duct",
+            "vent",
+            "\u{98ce}\u{7ba1}",
+            "\u{901a}\u{98ce}",
+            "\u{9001}\u{98ce}",
+            "\u{6392}\u{98ce}",
+            "\u{98ce}\u{9053}",
+        ];
+        let candidate_systems: Vec<Value> = classification["systems"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|system| {
+                let text = serde_json::to_string(system)
+                    .unwrap_or_default()
+                    .to_lowercase();
+                duct_terms.iter().any(|term| text.contains(term))
+            })
+            .cloned()
+            .collect();
+        let shared_layers = |property: &str| {
+            let mut names: Vec<String> = classification["systems"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .flat_map(|system| system[property].as_array().into_iter().flatten())
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect();
+            names.sort_by_key(|name| name.to_ascii_lowercase());
+            names.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+            names
+        };
+        let mut candidate_layer_set = std::collections::HashSet::new();
+        let mut candidate_annotation_layers = std::collections::HashSet::new();
+        for system in &candidate_systems {
+            for property in ["pipeLayers", "centerlineLayers", "annotationLayers"] {
+                for layer in system[property].as_array().into_iter().flatten() {
+                    if let Some(layer) = layer.as_str() {
+                        candidate_layer_set.insert(layer.to_ascii_lowercase());
+                        if property == "annotationLayers" {
+                            candidate_annotation_layers.insert(layer.to_ascii_lowercase());
+                        }
+                    }
+                }
+            }
+        }
+        for layer in shared_layers("centerlineLayers")
+            .into_iter()
+            .chain(shared_layers("annotationLayers"))
+        {
+            candidate_layer_set.insert(layer.to_ascii_lowercase());
+        }
+        candidate_annotation_layers.extend(
+            shared_layers("annotationLayers")
+                .into_iter()
+                .map(|layer| layer.to_ascii_lowercase()),
+        );
+        let annotation_layer_evidence =
+            duct_annotation_layer_evidence(doc, &candidate_annotation_layers);
+        for layer in annotation_layer_evidence
+            .as_object()
+            .into_iter()
+            .flat_map(|layers| layers.keys())
+        {
+            candidate_layer_set.insert(layer.to_ascii_lowercase());
+        }
+        let mut candidate_counts = std::collections::BTreeMap::<String, usize>::new();
+        for entity in doc.entities() {
+            let layer = &entity.common().layer;
+            if candidate_layer_set.contains(&layer.to_ascii_lowercase()) {
+                *candidate_counts.entry(layer.clone()).or_default() += 1;
+            }
+        }
+        return json!({
+            "ok": true,
+            "workflow": "native duct layer classification completed; no duct centerline extraction was run",
+            "status": "layer_selection_required",
+            "ductLayerCandidates": candidate_systems,
+            "centerlineLayerCandidates": shared_layers("centerlineLayers"),
+            "annotationLayerCandidates": shared_layers("annotationLayers"),
+            "candidateLayerEntityCounts": candidate_counts,
+            "annotationLayerEvidence": annotation_layer_evidence,
+            "next": "Choose the duct edge layer(s) from ductLayerCandidates. Inspect annotationLayerEvidence for actual text, dimensions and leader content; add relevant annotation layers and dashed centerline layers, then call ocs_duct_analyze again with pipe_layers and optional centerline_layers and annotation_layers."
+        });
+    }
+
+    let recognition = ocs_recognition::recognize_duct(
+        doc,
+        &ocs_recognition::DuctOptions {
+            pipe_layers: pipe_layers.clone(),
+            centerline_layers: centerline_layers.clone(),
+            annotation_layers: annotation_layers.clone(),
+            tolerance: arguments["tolerance"].as_f64().unwrap_or(5.0),
+            corrections: arguments
+                .get("corrections")
+                .cloned()
+                .unwrap_or_else(|| json!([])),
+            finalize: arguments["finalize"].as_bool().unwrap_or(false),
+        },
+    );
+    let count = |name: &str| recognition[name].as_array().map_or(0, Vec::len);
+    let mut type_counts = std::collections::BTreeMap::<String, usize>::new();
+    for component in recognition["components"].as_array().into_iter().flatten() {
+        if let Some(kind) = component["type"].as_str() {
+            *type_counts.entry(kind.to_owned()).or_default() += 1;
+        }
+    }
+    let collections = [
+        "components",
+        "pairedEdgeCandidates",
+        "junctionCandidates",
+        "connections",
+        "annotationTexts",
+        "dimensionTexts",
+        "reducerCandidates",
+        "verticalDuctCandidates",
+        "reviewItems",
+        "highlightHandles",
+    ];
+    let mut details = serde_json::Map::new();
+    for name in collections {
+        let Some(values) = recognition[name].as_array() else {
+            continue;
+        };
+        details.insert(
+            name.to_owned(),
+            json!({
+                "total": values.len(),
+                "items": values.iter().take(MAX_DUCT_TOOL_ITEMS).cloned().collect::<Vec<_>>(),
+                "truncated": values.len() > MAX_DUCT_TOOL_ITEMS,
+            }),
+        );
+    }
+    json!({
+        "ok": recognition["ok"],
+        "workflow": "native duct layer classification and topology extraction completed before model interpretation",
+        "schemaVersion": recognition["schemaVersion"],
+        "status": recognition["status"],
+        "complete": recognition["complete"],
+        "coverage": recognition["coverage"],
+        "selectedLayers": {"pipe":pipe_layers,"centerline":centerline_layers,"annotation":annotation_layers},
+        "selectedLayerEntityCounts": layer_counts,
+        "componentTypeCounts": type_counts,
+        "collectionCounts": collections.into_iter().map(|name| (name, count(name))).collect::<std::collections::BTreeMap<_, _>>(),
+        "details": details,
+        "next": "Use these source handles, dimensions and topology as native evidence. Combine them with labels and viewport inspection to classify uncertain fittings and risers; do not treat review candidates as confirmed."
+    })
+}
+
 #[derive(Clone, Debug)]
 pub struct AgentAttachment {
     path: PathBuf,
@@ -51,35 +307,61 @@ fn read_agent_attachment(path: PathBuf) -> Result<AgentAttachment, String> {
     const MAX_BYTES: u64 = 25 * 1024 * 1024;
     let metadata = fs::metadata(&path).map_err(|e| format!("{}: {e}", path.display()))?;
     if metadata.len() > MAX_BYTES {
-        return Err(format!("{} exceeds the 25 MB attachment limit", path.display()));
+        return Err(format!(
+            "{} exceeds the 25 MB attachment limit",
+            path.display()
+        ));
     }
-    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("attachment").to_string();
-    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("attachment")
+        .to_string();
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
     let bytes = fs::read(&path).map_err(|e| format!("{name}: {e}"))?;
     let text = match ext.as_str() {
         "png" | "jpg" | "jpeg" | "bmp" | "tif" | "tiff" | "webp" | "gif" => None,
-        "txt" | "md" | "csv" | "json" | "xml" | "yaml" | "yml" | "log" | "html" | "htm" | "rs" | "py" | "js" | "ts" => {
+        "txt" | "md" | "csv" | "json" | "xml" | "yaml" | "yml" | "log" | "html" | "htm" | "rs"
+        | "py" | "js" | "ts" => {
             Some(String::from_utf8(bytes).map_err(|_| format!("{name} is not valid UTF-8 text"))?)
         }
         "docx" => {
-            let archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).map_err(|e| format!("{name}: {e}"))?;
+            let archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
+                .map_err(|e| format!("{name}: {e}"))?;
             let mut archive = archive;
-            let mut document = archive.by_name("word/document.xml").map_err(|e| format!("{name}: {e}"))?;
+            let mut document = archive
+                .by_name("word/document.xml")
+                .map_err(|e| format!("{name}: {e}"))?;
             let mut xml = String::new();
-            std::io::Read::read_to_string(&mut document, &mut xml).map_err(|e| format!("{name}: {e}"))?;
+            std::io::Read::read_to_string(&mut document, &mut xml)
+                .map_err(|e| format!("{name}: {e}"))?;
             let root = roxmltree::Document::parse(&xml).map_err(|e| format!("{name}: {e}"))?;
-            Some(root.descendants().filter(|n| n.is_element() && n.tag_name().name() == "t")
-                .filter_map(|n| n.text()).collect::<Vec<_>>().join(" "))
+            Some(
+                root.descendants()
+                    .filter(|n| n.is_element() && n.tag_name().name() == "t")
+                    .filter_map(|n| n.text())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            )
         }
         "xlsx" | "xls" => {
-            use calamine::{Reader, open_workbook_auto};
+            use calamine::{open_workbook_auto, Reader};
             let mut workbook = open_workbook_auto(&path).map_err(|e| format!("{name}: {e}"))?;
             let mut output = String::new();
             for sheet in workbook.sheet_names().to_owned() {
                 if let Ok(range) = workbook.worksheet_range(&sheet) {
                     output.push_str(&format!("\n[{sheet}]\n"));
                     for row in range.rows() {
-                        output.push_str(&row.iter().map(ToString::to_string).collect::<Vec<_>>().join("\t"));
+                        output.push_str(
+                            &row.iter()
+                                .map(ToString::to_string)
+                                .collect::<Vec<_>>()
+                                .join("\t"),
+                        );
                         output.push('\n');
                     }
                 }
@@ -87,14 +369,23 @@ fn read_agent_attachment(path: PathBuf) -> Result<AgentAttachment, String> {
             Some(output)
         }
         "pdf" => {
-            let pdf = hayro::hayro_syntax::Pdf::new(bytes)
-                .map_err(|e| format!("{name}: {e:?}"))?;
+            let pdf = hayro::hayro_syntax::Pdf::new(bytes).map_err(|e| format!("{name}: {e:?}"))?;
             let mut output = String::new();
             for page in 1..=pdf.pages().len() {
-                let vectors = crate::scene::model::pdf_vector::page_vectors(&path.to_string_lossy(), &page.to_string())
-                    .ok_or_else(|| format!("Could not extract text from {name}, page {page}"))?;
+                let vectors = crate::scene::model::pdf_vector::page_vectors(
+                    &path.to_string_lossy(),
+                    &page.to_string(),
+                )
+                .ok_or_else(|| format!("Could not extract text from {name}, page {page}"))?;
                 output.push_str(&format!("\n[Page {page}]\n"));
-                output.push_str(&vectors.texts.iter().map(|item| item.text.as_str()).collect::<Vec<_>>().join("\n"));
+                output.push_str(
+                    &vectors
+                        .texts
+                        .iter()
+                        .map(|item| item.text.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                );
             }
             Some(output)
         }
@@ -357,11 +648,7 @@ impl Default for AgentPanelState {
 }
 
 impl AgentPanelState {
-    pub(super) fn apply_transcript_action(
-        &mut self,
-        index: usize,
-        action: text_editor::Action,
-    ) {
+    pub(super) fn apply_transcript_action(&mut self, index: usize, action: text_editor::Action) {
         if let Some(message) = self.messages.get_mut(index) {
             // The transcript is read-only. Navigation and selection actions
             // are still applied so mouse selection and Ctrl+A/Ctrl+C work,
@@ -379,7 +666,8 @@ impl AgentPanelState {
                 .last()
                 .is_none_or(|message| message.role != "assistant")
         {
-            self.messages.push(ChatMessage::new("assistant", String::new()));
+            self.messages
+                .push(ChatMessage::new("assistant", String::new()));
             self.streaming_message = true;
         }
         if let Some(message) = self.messages.last_mut() {
@@ -539,10 +827,7 @@ impl AgentPanelState {
                 container(column![
                     text(label).size(10),
                     text_editor::TextEditor::new(&message.content)
-                        .on_action(move |action| Message::AgentTranscriptAction(
-                            index,
-                            action,
-                        ))
+                        .on_action(move |action| Message::AgentTranscriptAction(index, action,))
                         .size(12)
                         .padding(0)
                         .height(iced::Length::Shrink)
@@ -602,6 +887,11 @@ impl AgentPanelState {
             button(text("Recognize structure").size(10))
                 .on_press_maybe((!self.busy).then_some(Message::AgentQuickPrompt(
                     "Recognize the active drawing structure with native ocs_read op recognize. Use model-space evidence, report complete, page cursors, and reviewItems, and do not modify anything.".into(),
+                )))
+                .padding([5, 7]),
+            button(text("Recognize ducts").size(10))
+                .on_press_maybe((!self.busy).then_some(Message::AgentQuickPrompt(
+                    "Use the ship duct recognition workflow. Call ocs_duct_analyze first to inspect candidate pipe, centerline, annotation and riser layers; compare them with the drawing and ask me to confirm or supplement ambiguous layer choices. Then call ocs_duct_analyze with the selected layers to extract duct topology, fittings, dimensions and riser candidates. Use ocs_capture with returned source handles for visual review. Show component types and reviewItems, and do not mark results final or modify the drawing until I approve.".into(),
                 )))
                 .padding([5, 7]),
             button(text("Analyze selection").size(10))
@@ -726,10 +1016,15 @@ impl AgentPanelState {
 
         let mut attachment_rows = column![].spacing(3);
         for (index, attachment) in self.attachments.iter().enumerate() {
-            attachment_rows = attachment_rows.push(row![
-                text(attachment.name.as_str()).size(10).width(Fill),
-                button(text("Remove").size(9)).on_press(Message::AgentRemoveAttachment(index)).padding([3, 6]),
-            ].spacing(4));
+            attachment_rows = attachment_rows.push(
+                row![
+                    text(attachment.name.as_str()).size(10).width(Fill),
+                    button(text("Remove").size(9))
+                        .on_press(Message::AgentRemoveAttachment(index))
+                        .padding([3, 6]),
+                ]
+                .spacing(4),
+            );
         }
         let composer = row![
             text_input("Ask the CAD agent…", &self.input)
@@ -739,7 +1034,10 @@ impl AgentPanelState {
                 .padding(8)
                 .width(Fill),
             button(text("Attach").size(10))
-                .on_press_maybe((!self.busy && self.attachments.len() < 10).then_some(Message::AgentPickAttachments))
+                .on_press_maybe(
+                    (!self.busy && self.attachments.len() < 10)
+                        .then_some(Message::AgentPickAttachments)
+                )
                 .padding([7, 8]),
             if self.busy {
                 button(text("Stop").size(11))
@@ -1019,8 +1317,16 @@ impl OpenCADStudio {
         let display_prompt = if attachments.is_empty() {
             prompt.clone()
         } else {
-            let names = attachments.iter().map(|item| item.name.as_str()).collect::<Vec<_>>().join(", ");
-            if prompt.is_empty() { format!("Attachments: {names}") } else { format!("{prompt}\n\nAttachments: {names}") }
+            let names = attachments
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            if prompt.is_empty() {
+                format!("Attachments: {names}")
+            } else {
+                format!("{prompt}\n\nAttachments: {names}")
+            }
         };
         self.agent.start_service();
         // Empty model means the runtime config, including custom providers.
@@ -1039,12 +1345,25 @@ impl OpenCADStudio {
         self.agent.busy = true;
         self.agent.status = "Thinking…".to_string();
         let cwd = self.agent.active_cwd(self);
+        let model = self.agent.selected_model();
+        let effort = self.agent.selected_effort();
+        self.dispatch_agent_prompt(prompt, attachments, cwd, model, effort)
+    }
+
+    fn dispatch_agent_prompt(
+        &mut self,
+        text: String,
+        attachments: Vec<AgentAttachment>,
+        cwd: PathBuf,
+        model: Option<String>,
+        effort: Option<String>,
+    ) -> Task<Message> {
         if !self.agent.send_command(AgentCommand::Prompt {
-            text: prompt,
+            text,
             attachments,
             cwd,
-            model: self.agent.selected_model(),
-            effort: self.agent.selected_effort(),
+            model,
+            effort,
         }) {
             self.agent.busy = false;
             self.agent.status = "The embedded Codex runtime is not available".to_string();
@@ -1054,26 +1373,44 @@ impl OpenCADStudio {
     }
 
     pub(super) fn pick_agent_attachments(&self) -> Task<Message> {
-        Task::perform(async {
-            let files = crate::sys::file_dialog()
-                .set_title("Attach files to the CAD agent")
-                .add_filter("Documents, images, and text", &["png", "jpg", "jpeg", "bmp", "tif", "tiff", "webp", "gif", "txt", "md", "csv", "json", "xml", "yaml", "yml", "log", "html", "htm", "rs", "py", "js", "ts", "docx", "xlsx", "xls", "pdf"])
-                .pick_files().await;
-            let mut results = Vec::new();
-            if let Some(files) = files {
-                for handle in files.into_iter().take(10) {
-                    results.push(read_agent_attachment(crate::sys::handle_path(&handle)));
+        Task::perform(
+            async {
+                let files = crate::sys::file_dialog()
+                    .set_title("Attach files to the CAD agent")
+                    .add_filter(
+                        "Documents, images, and text",
+                        &[
+                            "png", "jpg", "jpeg", "bmp", "tif", "tiff", "webp", "gif", "txt", "md",
+                            "csv", "json", "xml", "yaml", "yml", "log", "html", "htm", "rs", "py",
+                            "js", "ts", "docx", "xlsx", "xls", "pdf",
+                        ],
+                    )
+                    .pick_files()
+                    .await;
+                let mut results = Vec::new();
+                if let Some(files) = files {
+                    for handle in files.into_iter().take(10) {
+                        results.push(read_agent_attachment(crate::sys::handle_path(&handle)));
+                    }
                 }
-            }
-            results
-        }, Message::AgentAttachmentsLoaded)
+                results
+            },
+            Message::AgentAttachmentsLoaded,
+        )
     }
 
-    pub(super) fn agent_attachments_loaded(&mut self, results: Vec<Result<AgentAttachment, String>>) -> Task<Message> {
+    pub(super) fn agent_attachments_loaded(
+        &mut self,
+        results: Vec<Result<AgentAttachment, String>>,
+    ) -> Task<Message> {
         for result in results {
             match result {
-                Ok(attachment) if self.agent.attachments.len() < 10 => self.agent.attachments.push(attachment),
-                Ok(_) => self.agent.status = "The agent supports up to 10 attachments per message".into(),
+                Ok(attachment) if self.agent.attachments.len() < 10 => {
+                    self.agent.attachments.push(attachment)
+                }
+                Ok(_) => {
+                    self.agent.status = "The agent supports up to 10 attachments per message".into()
+                }
                 Err(error) => self.agent.status = error,
             }
         }
@@ -1190,7 +1527,10 @@ impl OpenCADStudio {
                 self.agent.questions.clear();
                 self.agent.pending_approvals.clear();
                 self.agent.streaming_message = false;
-                self.agent.status = self.agent.last_turn_error.clone()
+                self.agent.status = self
+                    .agent
+                    .last_turn_error
+                    .clone()
                     .unwrap_or_else(|| "Ready".to_string());
             }
             Some(AgentEvent::ConversationList(conversations)) => {
@@ -1218,9 +1558,7 @@ impl OpenCADStudio {
             Some(AgentEvent::ConversationStarted { id }) => {
                 self.agent.active_thread_id = (!id.is_empty()).then_some(id);
             }
-            Some(AgentEvent::ModelCatalog {
-                models,
-            }) => {
+            Some(AgentEvent::ModelCatalog { models }) => {
                 self.agent.model_catalog = models;
             }
             Some(AgentEvent::ApprovalRequest(approval)) => {
@@ -1320,6 +1658,62 @@ impl OpenCADStudio {
         let mut capture_path = None;
         let mut capture_max_dimension = 1600;
         let request = match tool.as_str() {
+            "ocs_duct_analyze" => {
+                if !self.agent_session_matches(&arguments) {
+                    self.agent.reply_to_tool(
+                        server_request_id,
+                        json!({ "ok": false, "code": "session_changed", "error": "Read the active OCS session before continuing." }),
+                        None,
+                    );
+                    return Task::none();
+                }
+                let state = self
+                    .control_request(json!({
+                        "op": "state",
+                        "protocol": 1,
+                        "session_id": arguments["ocs_session_id"],
+                    }))
+                    .0;
+                if state["ok"] != true {
+                    self.agent.reply_to_tool(server_request_id, state, None);
+                    return Task::none();
+                }
+                self.agent.document_context = Some(state.clone());
+                if state["documents"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .find(|document| document["id"] == state["document_id"])
+                    .is_some_and(|document| document["start"] == true)
+                {
+                    self.agent.reply_to_tool(
+                        server_request_id,
+                        json!({ "ok": false, "code": "no_document", "error": "Open a drawing before running ship-duct analysis." }),
+                        None,
+                    );
+                    return Task::none();
+                }
+                let document_id = state["document_id"].as_u64().unwrap_or_default();
+                let geometry_revision = state["geometry_revision"].clone();
+                let document = self.tabs[self.active_tab].scene.document.clone();
+                let request_id = server_request_id;
+                let arguments = arguments.clone();
+                return Task::perform(
+                    async move {
+                        std::thread::spawn(move || {
+                            let mut result = duct_agent_tool_result(&document, &arguments);
+                            result["document_id"] = json!(document_id);
+                            result["geometry_revision"] = geometry_revision;
+                            result
+                        })
+                        .join()
+                        .unwrap_or_else(|_| {
+                            json!({ "ok": false, "code": "duct_worker_failed", "error": "Native ship-duct analysis worker failed." })
+                        })
+                    },
+                    move |result| Message::AgentDuctToolReady(request_id, result),
+                );
+            }
             "ocs_sessions" => {
                 let state = self.control_request(json!({ "op": "state" })).0;
                 if state["ok"].as_bool() == Some(true) {
@@ -1626,6 +2020,10 @@ impl OpenCADStudio {
         task
     }
 
+    pub(super) fn agent_duct_tool_ready(&mut self, request_id: Value, result: Value) {
+        self.agent.reply_to_tool(request_id, result, None);
+    }
+
     fn agent_session_matches(&self, arguments: &Value) -> bool {
         arguments["ocs_session_id"]
             .as_str()
@@ -1761,7 +2159,7 @@ fn embedded_tool_definitions() -> Value {
             }
             "ocs_read" => {
                 tool["description"] = json!(
-                    "Read active drawing state, capabilities, command manifests, database records, entities, properties, layers, measurements, spatial relationships, history, and operation status. Native recognize reads live model-space structure with source handles, topology and review items; use layers and tolerance and follow independent collection page cursors. Use entity_schema for creation fields, validate for a preflight, and guide for CAD workflow information. Use batch_result for retained batch details from this session."
+                    "Read active drawing state, capabilities, command manifests, database records, entities, properties, layers, measurements, spatial relationships, history, and operation status. For duct or ventilation recognition, call the dedicated ocs_duct_analyze tool so native layer classification and topology extraction run before you interpret the drawing. Generic native recognize remains a bounded structural pass. Use entity_schema for creation fields, validate for a preflight, and guide for CAD workflow information. Use batch_result for retained batch details from this session."
                 );
             }
             "ocs_execute" => {
@@ -1792,11 +2190,31 @@ fn embedded_tool_definitions() -> Value {
             _ => {}
         }
     }
+    tools.push(json!({
+        "name":"ocs_duct_analyze",
+        "description":"Native ship-duct analysis tool. When the user asks to recognize a ventilation/duct drawing or its fittings, call this tool before giving the interpretation. First call with only ocs_session_id to inspect candidate pipe, centerline, annotation and riser layers; then choose the actual duct layers and call again with pipe_layers (and any relevant centerline_layers/annotation_layers). The selected-layer call runs native topology extraction, closed-outline and paired-edge fitting analysis, dimension matching/propagation, reducer and riser candidate detection, and returns component counts plus source handles for model/viewport review. Read-only: it never marks or modifies the drawing.",
+        "inputSchema":{
+            "type":"object",
+            "properties":{
+                "ocs_session_id":{"type":"string","minLength":1,"description":"Value of session_id returned by ocs_sessions."},
+                "pipe_layers":{"type":"array","items":{"type":"string"},"description":"Actual duct edge layers selected after reviewing the layer-candidate response. Omit on the first call to discover candidates."},
+                "centerline_layers":{"type":"array","items":{"type":"string"},"description":"Dashed centerline and riser evidence layers."},
+                "annotation_layers":{"type":"array","items":{"type":"string"},"description":"Dimension, leader and duct-size annotation layers."},
+                "tolerance":{"type":"number","minimum":0.000000001,"default":5,"description":"Endpoint merge tolerance in drawing units."},
+                "corrections":{"type":"array","items":{"type":"object","properties":{"componentId":{"type":"string"},"type":{"type":"string"}},"required":["componentId","type"],"additionalProperties":false},"description":"Model/user-reviewed component type corrections for a subsequent recognition pass."},
+                "finalize":{"type":"boolean","default":false,"description":"Set true only after the user reviews the preliminary results."}
+            },
+            "required":["ocs_session_id"],
+            "additionalProperties":false
+        },
+        "title":"Analyze ship duct geometry",
+        "annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}
+    }));
     Value::Array(tools.clone())
 }
 
 fn embedded_instructions() -> &'static str {
-    "You are the native CAD drawing and visual-inspection agent inside OpenCADStudio. Operate on the active in-process drawing through supplied OpenCADStudio tools. Start each new task with ocs_sessions and one ocs_read state call; preserve session_id, document_id and revision. These tools read the live in-memory CadDocument, including unsaved edits. Do not reopen or reparse the DWG, export it, or reread unchanged collections. Read only the data needed for the question. For broad inventory, discover record collections once, then page each required collection once while retaining handles and the returned revision; do not repeat a collection read during the same analysis. Native recognition results are cached for the current document and geometry revision, so use its page cursors without restarting analysis; after a drawing edit, read state and recognize the new revision. Recognition is a bounded structural pass, not a complete domain interpretation: inspect relevant layers, block attributes/definitions, text labels and viewport evidence, and report unsupported/ambiguous cases from reviewItems. Use viewport capture when visual context matters; distinguish world coordinates from pixels and state uncertainty. Discover CAD commands before running them; follow state.command.accepts/options/input_example for interactive commands. Use entity_schema and validate before structured edits. Modify only when requested and verify changes. After a timeout query the existing operation, never replay a mutation with a new request_id. Use the bundled CAD skills for design and quality guidance, but OpenCADStudio's native tools are authoritative for reading or editing this drawing; do not switch to AutoCAD COM, AutoLISP, Python, export-based parsing or external CAD applications."
+    "You are the native CAD drawing and visual-inspection agent inside OpenCADStudio. Operate on the active in-process drawing through supplied OpenCADStudio tools. Start each new task with ocs_sessions and one ocs_read state call; preserve session_id, document_id and revision. Use ocs_read op recognize for generic structural inspection and ocs_read op commands when discovering commands. These tools read the live in-memory CadDocument, including unsaved edits. Do not reopen or reparse the DWG, export it, or reread unchanged collections. Read only the data needed for the question. For broad inventory, discover record collections once, then page each required collection once while retaining handles and the returned revision; do not repeat a collection read during the same analysis. Native recognition results are cached for the current document and geometry revision, so use their returned results without restarting analysis; after a drawing edit, read state and recognize the new revision. When you identify a duct or ventilation recognition task, call ocs_duct_analyze before interpreting geometry: first request candidate layers, then select the actual duct, centerline and annotation layers and run native extraction. Combine the tool output with labels and viewport capture evidence, and use ocs_capture with returned source handles when visual review helps. Present straight, elbow, tee, cross, reducer/unknown and vertical-duct results with their evidence and reviewItems. Use labels, dimensions, topology, and viewport evidence to review uncertain types; never claim reducer dimensions or a riser connection are confirmed when evidence is incomplete. Duct recognition is read-only. For other generic structural questions, inspect relevant layers, block attributes/definitions, text labels and viewport evidence, and report unsupported/ambiguous cases. Use viewport capture when visual context matters; distinguish world coordinates from pixels and state uncertainty. Discover CAD commands with ocs_read op commands before running them; run them with ocs_execute op run and follow state.command.accepts/options/input_example for interactive commands. Use the drawing-unit tolerance exposed by the relevant tool schema. Use entity_schema and validate before structured edits. Modify only when requested and verify them by reading the resulting drawing. After a timeout query the existing operation, never replay a mutation with a new request_id. Use the bundled CAD skills for design and quality guidance, but OpenCADStudio's native tools are authoritative for reading or editing this drawing; do not switch to AutoCAD COM, AutoLISP, Python, export-based parsing or external CAD applications."
 }
 
 fn bundled_skills_root() -> Option<PathBuf> {
@@ -2158,8 +2576,13 @@ fn agent_error_message(error: &str) -> String {
     {
         return format!("模型服务协议不兼容：当前代理的上游账号仅支持 Chat Completions，CAD Agent 的工具调用需要 Responses API。请在模型代理中切换到支持 Responses 工具调用的上游账号或服务，然后重试。\n\n服务原始错误：{error}");
     }
-    if lower.contains("401") || lower.contains("unauthorized") || lower.contains("not authenticated") {
-        return format!("模型服务身份验证失败。请检查当前服务的登录状态或 API Key，然后重试。\n\n{error}");
+    if lower.contains("401")
+        || lower.contains("unauthorized")
+        || lower.contains("not authenticated")
+    {
+        return format!(
+            "模型服务身份验证失败。请检查当前服务的登录状态或 API Key，然后重试。\n\n{error}"
+        );
     }
     error.to_string()
 }
@@ -2487,6 +2910,163 @@ fn next_request_id(serial: &mut u64) -> RequestId {
 mod tests {
     use super::*;
 
+    #[test]
+    fn duct_tool_first_call_returns_candidate_layers_for_model_selection() {
+        use codec::tables::Layer;
+        let mut doc = codec::CadDocument::new();
+        doc.layers.add(Layer::new("422_Duct")).unwrap();
+        doc.layers.add(Layer::new("403_Dimension")).unwrap();
+        doc.layers
+            .add(Layer::new("3\u{4e2d}\u{5fc3}\u{7ebf}\u{5c42}"))
+            .unwrap();
+        let result = duct_agent_tool_result(&doc, &json!({}));
+        assert_eq!(result["status"], "layer_selection_required");
+        assert!(result["ductLayerCandidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|system| system["pipeLayers"] == json!(["422_Duct"])));
+        assert!(result["centerlineLayerCandidates"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("3\u{4e2d}\u{5fc3}\u{7ebf}\u{5c42}")));
+        assert!(result["annotationLayerCandidates"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("403_Dimension")));
+    }
+
+    #[test]
+    fn duct_tool_selected_layers_run_native_outline_and_dimension_extraction() {
+        use codec::entities::{Line, Text};
+        use codec::tables::Layer;
+        use codec::types::Vector3;
+        use codec::EntityType;
+
+        let mut doc = codec::CadDocument::new();
+        let pipe_layer = "05-\u{9001}\u{98ce}\u{7ba1}";
+        let centerline_layer = "05-\u{9001}\u{98ce}\u{7ba1}-\u{4e2d}\u{5fc3}\u{7ebf}";
+        let annotation_layer = "05-\u{9001}\u{98ce}\u{7ba1}-\u{6807}\u{6ce8}";
+        for layer in [pipe_layer, centerline_layer, annotation_layer] {
+            doc.layers.add(Layer::new(layer)).unwrap();
+        }
+        for (a, b) in [
+            ([0.0, 0.0], [100.0, 0.0]),
+            ([100.0, 0.0], [100.0, 50.0]),
+            ([100.0, 50.0], [0.0, 50.0]),
+            ([0.0, 50.0], [0.0, 0.0]),
+        ] {
+            let mut line =
+                Line::from_points(Vector3::new(a[0], a[1], 0.0), Vector3::new(b[0], b[1], 0.0));
+            line.common.layer = pipe_layer.into();
+            doc.add_entity(EntityType::Line(line)).unwrap();
+        }
+        let mut label = Text::new();
+        label.value = "800x500".into();
+        label.insertion_point = Vector3::new(50.0, 2.0, 0.0);
+        label.common.layer = annotation_layer.into();
+        doc.add_entity(EntityType::Text(label)).unwrap();
+
+        let result = duct_agent_tool_result(
+            &doc,
+            &json!({
+                "pipe_layers":[pipe_layer],
+                "centerline_layers":[centerline_layer],
+                "annotation_layers":[annotation_layer],
+                "tolerance":0.01
+            }),
+        );
+        assert_eq!(result["ok"], true, "{result}");
+        assert_eq!(result["complete"], true, "{result}");
+        assert_eq!(result["componentTypeCounts"]["duct_segment"], 1);
+        assert_eq!(
+            result["details"]["components"]["items"][0]["size"],
+            json!([800.0, 500.0])
+        );
+        assert_eq!(
+            result["details"]["components"]["items"][0]["sizeEvidence"],
+            "dimension_text"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires OCS_DUCT_TEST_DWG to point at the supplied drawing"]
+    fn supplied_dwg_runs_through_the_agent_duct_tool() {
+        let path = std::env::var_os("OCS_DUCT_TEST_DWG")
+            .expect("set OCS_DUCT_TEST_DWG to the supplied DWG path");
+        let doc = crate::io::load_file(std::path::Path::new(&path)).expect("load test DWG");
+        let candidates = duct_agent_tool_result(&doc, &json!({}));
+        assert!(
+            candidates["annotationLayerEvidence"]["422_Vent. texte"]["textSamples"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|sample| sample["text"] == "550x300"),
+            "candidate evidence should expose the actual duct size label: {candidates}"
+        );
+        assert_eq!(
+            candidates["status"], "layer_selection_required",
+            "{candidates}"
+        );
+        let pipe_layers = candidates["ductLayerCandidates"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|system| system["pipeLayers"].as_array().into_iter().flatten())
+            .filter_map(Value::as_str)
+            .filter(|layer| layer.to_ascii_lowercase().contains("duct"))
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let result = duct_agent_tool_result(
+            &doc,
+            &json!({
+                "pipe_layers":pipe_layers,
+                "centerline_layers":["3\u{4e2d}\u{5fc3}\u{7ebf}\u{5c42}"],
+                "annotation_layers":["403_Dimension","7\u{6807}\u{6ce8}\u{5c42}","422_Vent. texte"],
+                "tolerance":5.0
+            }),
+        );
+        assert!(
+            result["details"]["dimensionTexts"]["items"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|dimension| dimension["size"] == json!([550.0, 300.0])),
+            "native extraction should parse the drawing's 550x300 duct label: {result}"
+        );
+        let matched_dimensions = result["details"]["components"]["items"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|component| component["size"] == json!([550.0, 300.0]))
+            .count();
+        assert!(
+            matched_dimensions > 0,
+            "expected the 550x300 drawing label to reach at least one component: {result}"
+        );
+        eprintln!(
+            "agent duct tool fixture result: {}",
+            json!({
+                "ok":result["ok"],
+                "complete":result["complete"],
+                "coverage":result["coverage"],
+                "selectedLayers":result["selectedLayers"],
+                "selectedLayerEntityCounts":result["selectedLayerEntityCounts"],
+                "componentTypeCounts":result["componentTypeCounts"],
+                "matched550x300Components":matched_dimensions,
+                "collectionCounts":result["collectionCounts"]
+            })
+        );
+        assert_eq!(result["ok"], true, "{result}");
+        assert!(
+            result["collectionCounts"]["components"]
+                .as_u64()
+                .unwrap_or(0)
+                > 0,
+            "expected duct geometry to produce components"
+        );
+    }
+
     fn call_native_tool(app: &mut OpenCADStudio, tool: &str, arguments: Value) -> Value {
         let (sender, mut receiver) = mpsc::unbounded();
         app.agent.commands = Some(sender);
@@ -2516,7 +3096,9 @@ mod tests {
         insert
             .attributes
             .push(AttributeEntity::simple("Name", "Pump A"));
-        let handle = app.tabs[app.active_tab].scene.add_entity(EntityType::Insert(insert));
+        let handle = app.tabs[app.active_tab]
+            .scene
+            .add_entity(EntityType::Insert(insert));
         let session = call_native_tool(&mut app, "ocs_sessions", json!({}));
         let session_id = session["result"][0]["session_id"].clone();
         let request = json!({
@@ -2550,7 +3132,8 @@ mod tests {
             "Pump B"
         );
 
-        app.tabs.push(super::super::document::DocumentTab::new_drawing(99));
+        app.tabs
+            .push(super::super::document::DocumentTab::new_drawing(99));
         app.active_tab = app.tabs.len() - 1;
         let next = call_native_tool(&mut app, "ocs_read", request);
         assert_ne!(next["document_id"], first["document_id"]);
@@ -2567,9 +3150,25 @@ mod tests {
         let _ = app.on_agent_event(Some(AgentEvent::TurnComplete));
         assert!(!app.agent.busy);
         assert!(app.agent.status.contains("Responses"));
-        assert!(app.agent.messages.iter().any(|m| m.text == "Reading the drawing"));
-        assert!(app.agent.messages.last().unwrap().text.contains("模型服务协议不兼容"));
-        assert!(!app.agent.messages.last().unwrap().text.contains("身份验证失败"));
+        assert!(app
+            .agent
+            .messages
+            .iter()
+            .any(|m| m.text == "Reading the drawing"));
+        assert!(app
+            .agent
+            .messages
+            .last()
+            .unwrap()
+            .text
+            .contains("模型服务协议不兼容"));
+        assert!(!app
+            .agent
+            .messages
+            .last()
+            .unwrap()
+            .text
+            .contains("身份验证失败"));
     }
 
     #[test]
@@ -2577,7 +3176,9 @@ mod tests {
         let mut app = OpenCADStudio::new_for_test();
         app.agent.busy = true;
         app.agent.append_assistant_delta("Working");
-        let _ = app.on_agent_event(Some(AgentEvent::TurnRetrying("temporary disconnect".into())));
+        let _ = app.on_agent_event(Some(AgentEvent::TurnRetrying(
+            "temporary disconnect".into(),
+        )));
         assert!(app.agent.busy);
         assert!(app.agent.streaming_message);
         assert!(app.agent.last_turn_error.is_none());
@@ -2731,15 +3332,17 @@ mod tests {
     #[test]
     fn transcript_supports_selection_but_rejects_editing() {
         let mut panel = AgentPanelState::default();
-        panel.messages.push(ChatMessage::new("assistant", "copy me"));
+        panel
+            .messages
+            .push(ChatMessage::new("assistant", "copy me"));
 
         panel.apply_transcript_action(0, text_editor::Action::SelectAll);
-        assert_eq!(panel.messages[0].content.selection().as_deref(), Some("copy me"));
-
-        panel.apply_transcript_action(
-            0,
-            text_editor::Action::Edit(text_editor::Edit::Insert('!')),
+        assert_eq!(
+            panel.messages[0].content.selection().as_deref(),
+            Some("copy me")
         );
+
+        panel.apply_transcript_action(0, text_editor::Action::Edit(text_editor::Edit::Insert('!')));
         assert_eq!(panel.messages[0].text, "copy me");
         assert_eq!(panel.messages[0].content.text(), "copy me");
     }
@@ -2771,8 +3374,21 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            ["ocs_sessions", "ocs_read", "ocs_execute", "ocs_capture"]
+            [
+                "ocs_sessions",
+                "ocs_read",
+                "ocs_execute",
+                "ocs_capture",
+                "ocs_duct_analyze"
+            ]
         );
+        let duct = tools
+            .iter()
+            .find(|tool| tool["name"] == "ocs_duct_analyze")
+            .expect("dedicated duct agent tool");
+        assert!(duct["inputSchema"]["properties"]
+            .get("pipe_layers")
+            .is_some());
 
         let sessions = tools
             .iter()
@@ -2817,6 +3433,7 @@ mod tests {
             "ocs_sessions",
             "ocs_read op commands",
             "ocs_execute op run",
+            "ocs_duct_analyze",
             "viewport capture",
             "drawing-unit tolerance",
             "world coordinates from pixels",

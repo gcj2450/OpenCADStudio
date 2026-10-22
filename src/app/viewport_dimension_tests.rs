@@ -361,7 +361,10 @@ fn viewport_dimension_angular_preserves_angle_without_length_factor() {
     let _ = app.feed_command(StepInput::Point(place));
     let doc = &app.tabs[app.active_tab].scene.document;
     assert_eq!(
-        preview_text(&app, &EntityType::Dimension(Box::new(dimension(doc).clone()))),
+        preview_text(
+            &app,
+            &EntityType::Dimension(Box::new(dimension(doc).clone()))
+        ),
         value
     );
     assert!((dimension(doc).measurement() - 90.0).abs() < 1e-5);

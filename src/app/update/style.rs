@@ -977,11 +977,9 @@ impl OpenCADStudio {
     ) -> Task<Message> {
         let i = self.active_tab;
         if field == "arrowhead_handle" {
-            let handle = crate::entities::arrowheads::resolve(
-                &mut self.tabs[i].scene.document,
-                &value,
-            )
-            .filter(|h| !h.is_null());
+            let handle =
+                crate::entities::arrowheads::resolve(&mut self.tabs[i].scene.document, &value)
+                    .filter(|h| !h.is_null());
             if let Some(s) = self.mleaderstyle_mut(i) {
                 s.arrowhead_handle = handle;
             }

@@ -51,6 +51,8 @@ const READ_OPS: &[&str] = &[
     "tools",
     "entities",
     "recognize",
+    "duct_layers",
+    "duct_recognize",
     "layers",
     "header",
     "properties",
@@ -2485,12 +2487,21 @@ pub(crate) fn tool_definitions() -> Value {
             "title":"Capture OCS window","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}
         }
     ]);
-    let read = definitions.as_array_mut().unwrap().iter_mut()
-        .find(|tool| tool["name"] == "ocs_read").expect("read tool is defined");
-    read["description"] = json!(format!("{} Native recognize reads live model-space structure, source handles, topology and review items without exports. Use layers and tolerance to select candidate centerlines; every collection has independent offset/limit paging.", read["description"].as_str().unwrap_or_default()));
+    let read = definitions
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|tool| tool["name"] == "ocs_read")
+        .expect("read tool is defined");
+    read["description"] = json!(format!("{} Native recognize reads live model-space structure, source handles, topology and review items without exports. The embedded agent exposes ocs_duct_analyze as the dedicated read-only duct workflow: call it first for candidate layers, then call it with selected pipe, centerline and annotation layers before model interpretation. For other clients, classify layers with duct_layers, then call duct_recognize with candidate pipe and centerline layers. Treat component types and riser connections as provisional until visual and dimension evidence supports them.", read["description"].as_str().unwrap_or_default()));
     let properties = &mut read["inputSchema"]["properties"]["parameters"]["properties"];
     properties["layers"] = json!({"type":"array","items":{"type":"string"},"description":"Case-insensitive native recognition layer filters; omit for all candidate geometry."});
     properties["tolerance"] = json!({"type":"number","minimum":1e-9,"description":"Native recognition endpoint tolerance in drawing units (default 1). Result limit is capped at 1000 per collection."});
+    properties["pipe_layers"] = json!({"type":"array","items":{"type":"string"},"description":"User-confirmed duct layers from duct_layers; required by duct_recognize."});
+    properties["centerline_layers"] = json!({"type":"array","items":{"type":"string"},"description":"User-confirmed dashed duct/riser centerline layers."});
+    properties["annotation_layers"] = json!({"type":"array","items":{"type":"string"},"description":"Duct size and leader annotation layers used to match width × height labels to outlines."});
+    properties["corrections"] = json!({"type":"array","items":{"type":"object","properties":{"componentId":{"type":"string"},"type":{"type":"string"}},"required":["componentId","type"],"additionalProperties":false},"description":"User-provided component type corrections, applied by duct_recognize."});
+    properties["finalize"] = json!({"type":"boolean","default":false,"description":"Set true only after the user reviews the preliminary highlighted results."});
     definitions
 }
 
@@ -3215,10 +3226,15 @@ mod tests {
         let run_var = find_variant("run");
         assert_eq!(run_var["properties"]["cmd"]["type"], "string");
         assert!(READ_OPS.contains(&"commands"));
-        crate::schema_validation::validate_shape(read_schema, &json!({
-            "ocs_session_id":"test", "op":"recognize",
-            "parameters":{"layers":["PIPES"],"tolerance":0.01,"offset":0,"limit":200}
-        }), "").unwrap();
+        crate::schema_validation::validate_shape(
+            read_schema,
+            &json!({
+                "ocs_session_id":"test", "op":"recognize",
+                "parameters":{"layers":["PIPES"],"tolerance":0.01,"offset":0,"limit":200}
+            }),
+            "",
+        )
+        .unwrap();
         assert!(EXECUTE_OPS.contains(&"run"));
         assert!(READ_OPS.contains(&"capabilities"));
         assert!(READ_OPS.contains(&"records"));

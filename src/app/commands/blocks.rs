@@ -63,9 +63,8 @@ impl OpenCADStudio {
             remembered.allow_exploding = state.allow_exploding;
             remembered.open_in_editor = state.open_in_editor;
         }
-        self.block_definition_open_editor = state
-            .open_in_editor
-            .then(|| state.name.trim().to_string());
+        self.block_definition_open_editor =
+            state.open_in_editor.then(|| state.name.trim().to_string());
         self.persist_settings_if_changed();
         let i = self.active_tab;
         let base_point = state.parse_base_point();

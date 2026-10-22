@@ -424,10 +424,8 @@ impl OpenCADStudio {
         let i = self.active_tab;
         self.push_undo_snapshot(i, "INSERT");
         self.merge_dependencies(i, &deps);
-        let apps = crate::app::command_driver::clipboard::eed_app_map(
-            &self.tabs[i].scene.document,
-            &deps,
-        );
+        let apps =
+            crate::app::command_driver::clipboard::eed_app_map(&self.tabs[i].scene.document, &deps);
         let mut created = Vec::new();
         for def in &deps.blocks {
             let scene = &mut self.tabs[i].scene;

@@ -35,7 +35,10 @@ async fn pick(title: String, filters: Vec<(String, Vec<String>)>) -> Option<Stri
 
 fn dgn_filters() -> Vec<(String, Vec<String>)> {
     vec![
-        ("MicroStation DGN (*.dgn)".to_string(), vec!["dgn".to_string()]),
+        (
+            "MicroStation DGN (*.dgn)".to_string(),
+            vec!["dgn".to_string()],
+        ),
         ("All DGN Files (*.*)".to_string(), vec!["*".to_string()]),
     ]
 }
@@ -55,7 +58,9 @@ fn exists(path: &str) -> bool {
 fn is_dgn(path: &str) -> bool {
     crate::scene::model::underlay_vector::item_names(codec::entities::UnderlayType::Dgn, path)
         .and_then(|models| models.into_iter().next())
-        .is_some_and(|model| crate::scene::model::underlay_vector::dgn_import(path, &model).is_some())
+        .is_some_and(|model| {
+            crate::scene::model::underlay_vector::dgn_import(path, &model).is_some()
+        })
 }
 
 /// The importer a file goes to.
@@ -75,7 +80,11 @@ fn route(path: &str, format: Option<usize>) -> Result<Route, String> {
     }
     let ext = extension(path);
     let by_extension = f.is_none_or(|f| f.support == Support::ByExtension);
-    let pdf = if by_extension { ext == "pdf" } else { f.is_some_and(|f| f.name == "PDF Files") };
+    let pdf = if by_extension {
+        ext == "pdf"
+    } else {
+        f.is_some_and(|f| f.name == "PDF Files")
+    };
     if pdf {
         return Ok(Route::Pdf);
     }
@@ -90,10 +99,12 @@ fn route(path: &str, format: Option<usize>) -> Result<Route, String> {
     let named = FORMATS
         .iter()
         .find(|f| f.extensions.iter().any(|e| e.eq_ignore_ascii_case(&ext)));
-    Err(match named.and_then(|f| unsupported_reason(f.support).map(|r| (f, r))) {
-        Some((f, reason)) => format!("{}: {reason}", f.name),
-        None => crate::t!("OpenCAD Studio has no importer for this format.").into_owned(),
-    })
+    Err(
+        match named.and_then(|f| unsupported_reason(f.support).map(|r| (f, r))) {
+            Some((f, reason)) => format!("{}: {reason}", f.name),
+            None => crate::t!("OpenCAD Studio has no importer for this format.").into_owned(),
+        },
+    )
 }
 
 impl OpenCADStudio {
@@ -145,7 +156,12 @@ impl OpenCADStudio {
     }
 
     pub(in crate::app) fn open_import_file_dialog(&mut self) {
-        let path = self.import_dialogs.recent.first().cloned().unwrap_or_default();
+        let path = self
+            .import_dialogs
+            .recent
+            .first()
+            .cloned()
+            .unwrap_or_default();
         self.import_dialogs.file = Some(ImportFileState {
             path,
             format: 0,
@@ -165,9 +181,8 @@ impl OpenCADStudio {
         };
         // The options chosen last stay when the file is changed.
         let previous = self.import_dialogs.dgn.take();
-        let keep = |f: fn(&DgnImportState) -> bool, default: bool| {
-            previous.as_ref().map_or(default, f)
-        };
+        let keep =
+            |f: fn(&DgnImportState) -> bool, default: bool| previous.as_ref().map_or(default, f);
         self.import_dialogs.dgn = Some(DgnImportState {
             path: path.to_string(),
             version: if import.v7 { "V7" } else { "V8" },
@@ -224,7 +239,10 @@ impl OpenCADStudio {
         }
     }
 
-    pub(in crate::app) fn update_import_dialog(&mut self, message: ImportDialogMsg) -> Task<Message> {
+    pub(in crate::app) fn update_import_dialog(
+        &mut self,
+        message: ImportDialogMsg,
+    ) -> Task<Message> {
         let i = self.active_tab;
         match message {
             ImportDialogMsg::Help(which) => {
@@ -232,9 +250,9 @@ impl OpenCADStudio {
                     "dgn" => crate::t!(
                         "Imports a DGN model as drawing objects: levels as layers, cells as blocks."
                     ),
-                    _ => crate::t!(
-                        "Imports a file of the chosen format with the format's importer."
-                    ),
+                    _ => {
+                        crate::t!("Imports a file of the chosen format with the format's importer.")
+                    }
                 };
                 self.command_line.push_info(help.as_ref());
             }
@@ -339,7 +357,8 @@ impl OpenCADStudio {
                 if let Some(s) = self.import_dialogs.dgn.as_mut() {
                     if let Some(model) = s.models.get(k) {
                         if let Some(import) = dgn_import(&s.path, &model.label) {
-                            s.mapping = [0, 1, 2, 3].map(|tab| dgn_import::mapping_rows(&import, tab));
+                            s.mapping =
+                                [0, 1, 2, 3].map(|tab| dgn_import::mapping_rows(&import, tab));
                             s.units = import.unit_names.clone();
                         }
                         s.model = k;
@@ -395,7 +414,11 @@ impl OpenCADStudio {
     }
 
     /// The import: into a new drawing (or the current one), one undo step.
-    pub(in crate::app) fn run_dgn_import(&mut self, i: usize, request: DgnImportRequest) -> Task<Message> {
+    pub(in crate::app) fn run_dgn_import(
+        &mut self,
+        i: usize,
+        request: DgnImportRequest,
+    ) -> Task<Message> {
         let Some(import) =
             crate::scene::model::underlay_vector::dgn_import(&request.path, &request.model)
         else {
@@ -403,8 +426,7 @@ impl OpenCADStudio {
                 .push_error(crate::t!("Invalid or unsupported DGN file.").as_ref());
             return Task::none();
         };
-        let converted =
-            dgn_import::convert(&import, request.sub_units, request.explode_text_nodes);
+        let converted = dgn_import::convert(&import, request.sub_units, request.explode_text_nodes);
         let mut task = Task::none();
         let i = if request.current_drawing {
             i
@@ -420,8 +442,8 @@ impl OpenCADStudio {
         let scene = &mut self.tabs[i].scene;
         // In the current drawing, names it already has keep the existing
         // definitions, or are imported under the file's name as prefix.
-        let prefix = (request.current_drawing && request.prefix_duplicates)
-            .then(|| format!("{stem}$0$"));
+        let prefix =
+            (request.current_drawing && request.prefix_duplicates).then(|| format!("{stem}$0$"));
         let rename = |taken: bool, name: &str| match &prefix {
             Some(p) if taken && name != "0" => format!("{p}{name}"),
             _ => name.to_string(),

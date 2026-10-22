@@ -163,7 +163,9 @@ mod tests {
             app.donation_prompt_version = version.to_string();
             app.queue_startup_prompts();
             assert_ne!(app.active_modal, Some(ModalKind::DonationPrompt));
-            assert!(!app.pending_startup_modals.contains(&ModalKind::DonationPrompt));
+            assert!(!app
+                .pending_startup_modals
+                .contains(&ModalKind::DonationPrompt));
         }
     }
 

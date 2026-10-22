@@ -4,7 +4,10 @@
 //! This first native reader supports planar centerlines and named symbols.
 //! It reports unsupported geometry and ambiguous crossings for review; it does
 //! not infer connectivity through equipment or across symbol gaps.
+mod duct;
 mod topology;
+
+pub use duct::{classify_duct_layers, recognize_duct, DuctOptions};
 
 use codec::{
     entities::EntityType as E,
@@ -87,6 +90,7 @@ struct Reader<'a> {
     options: &'a Options,
     blocks: HashMap<String, &'a codec::tables::BlockRecord>,
     members: HashMap<Handle, Vec<Handle>>,
+    relevant_blocks: HashMap<(Handle, String), bool>,
     segments: Vec<Segment>,
     components: Vec<Value>,
     texts: Vec<Value>,
@@ -141,6 +145,51 @@ impl Reader<'_> {
                 .iter()
                 .any(|l| l.eq_ignore_ascii_case(layer))
     }
+    fn block_relevant(
+        &mut self,
+        block: Handle,
+        inherited_layer: &str,
+        stack: &mut HashSet<Handle>,
+    ) -> bool {
+        let cache_key = (block, inherited_layer.to_ascii_lowercase());
+        if let Some(relevant) = self.relevant_blocks.get(&cache_key) {
+            return *relevant;
+        }
+        if !stack.insert(block) {
+            return false;
+        }
+        let members = self.members.get(&block).cloned().unwrap_or_default();
+        let mut relevant = false;
+        for handle in members {
+            let Some(entity) = self.doc.get_entity(handle) else {
+                continue;
+            };
+            let common = entity.common();
+            if common.invisible {
+                continue;
+            }
+            let layer = if common.layer == "0" {
+                inherited_layer
+            } else {
+                common.layer.as_str()
+            };
+            if self.selected(layer) {
+                relevant = true;
+                break;
+            }
+            if let E::Insert(insert) = entity {
+                if let Some(nested) = self.blocks.get(&insert.block_name.to_uppercase()) {
+                    relevant = self.block_relevant(nested.handle, layer, stack);
+                    if relevant {
+                        break;
+                    }
+                }
+            }
+        }
+        stack.remove(&block);
+        self.relevant_blocks.insert(cache_key, relevant);
+        relevant
+    }
     fn segment(&mut self, a: Vector3, b: Vector3, source: &str, style: &Style, bridge: bool) {
         if ![a.x, a.y, a.z, b.x, b.y, b.z]
             .iter()
@@ -178,16 +227,32 @@ impl Reader<'_> {
         path: &str,
         stack: &mut Vec<Handle>,
     ) {
-        if self.visits >= MAX_VISITS {
-            self.truncated = true;
-            return;
-        }
-        self.visits += 1;
         let common = e.common();
         let style = self.style(e, parent);
         if style.layer.eq_ignore_ascii_case(OVERLAY_LAYER) || common.invisible {
             return;
         }
+        let selected = self.selected(&style.layer);
+        // Ignore unrelated leaf entities before charging the bounded walk.
+        // Unselected inserts still need inspection because their block members
+        // can explicitly live on one of the requested evidence layers.
+        if !selected {
+            if let E::Insert(insert) = e {
+                let Some(block) = self.blocks.get(&insert.block_name.to_uppercase()) else {
+                    return;
+                };
+                if !self.block_relevant(block.handle, &style.layer, &mut HashSet::new()) {
+                    return;
+                }
+            } else {
+                return;
+            }
+        }
+        if self.visits >= MAX_VISITS {
+            self.truncated = true;
+            return;
+        }
+        self.visits += 1;
         let source = if path.is_empty() {
             h(common.handle)
         } else {
@@ -199,12 +264,13 @@ impl Reader<'_> {
             E::Insert(_) => "INSERT",
             E::Text(_) => "TEXT",
             E::MText(_) => "MTEXT",
+            E::Dimension(_) => "DIMENSION",
+            E::MultiLeader(_) => "MULTILEADER",
             E::Arc(_) => "ARC",
             E::Circle(_) => "CIRCLE",
             _ => "OTHER",
         };
         *self.inventory.entry(kind.into()).or_default() += 1;
-        let selected = self.selected(&style.layer);
         match e {
             E::Insert(ins)=>{
                 let name=ins.block_name.to_uppercase();
@@ -268,7 +334,24 @@ impl Reader<'_> {
             }
             E::Text(t) if selected => self.texts.push(json!({"source":source,"text":t.value,"position":xy(transform.apply(t.insertion_point)),"layer":style.layer})),
             E::MText(t) if selected => self.texts.push(json!({"source":source,"text":codec::entities::mtext_format::parse_mtext(&t.value,true).to_plain_text(),"position":xy(transform.apply(t.insertion_point)),"layer":style.layer})),
-            E::Circle(_) | E::Hatch(_) | E::Solid(_) | E::Point(_) | E::AttributeDefinition(_) | E::AttributeEntity(_) | E::Dimension(_) | E::Leader(_) | E::MultiLeader(_) | E::Block(_) | E::BlockEnd(_) | E::Seqend(_) => {},
+            E::Dimension(dimension) if selected => {
+                let base = dimension.base();
+                let has_text_override = base
+                    .text_override()
+                    .is_some_and(|value| !value.trim().is_empty() && value.trim() != "*");
+                let text = if has_text_override {
+                    base.text_override().unwrap_or_default().to_owned()
+                } else {
+                    format!("{}", dimension.measurement())
+                };
+                self.texts.push(json!({"source":source,"text":text,"position":xy(transform.apply(base.text_middle_point)),"layer":style.layer,"entityType":"DIMENSION","measurement":dimension.measurement(),"hasTextOverride":has_text_override}));
+            }
+            E::MultiLeader(leader) if selected => {
+                if let Some(value) = leader.text() {
+                    self.texts.push(json!({"source":source,"text":codec::entities::mtext_format::parse_mtext(value,true).to_plain_text(),"position":xy(transform.apply(leader.context.text_location)),"layer":style.layer,"entityType":"MULTILEADER"}));
+                }
+            }
+            E::Circle(_) | E::Hatch(_) | E::Solid(_) | E::Point(_) | E::AttributeDefinition(_) | E::AttributeEntity(_) | E::Leader(_) | E::Block(_) | E::BlockEnd(_) | E::Seqend(_) => {},
             _ if selected => self.review(json!({"type":"unsupported_geometry","source":source,"entityType":kind})),
             _=>{}
         }
@@ -324,6 +407,7 @@ fn recognize_impl(doc: &CadDocument, options: &Options, paged: bool) -> Value {
         options,
         blocks,
         members,
+        relevant_blocks: HashMap::new(),
         segments: vec![],
         components: vec![],
         texts: vec![],
@@ -490,13 +574,57 @@ mod tests {
     fn excluded_symbol_strokes_do_not_leak_into_selected_layers() {
         let mut doc = CadDocument::new();
         let valve = block(&mut doc, "VALVE", Vector3::ZERO);
-        line(&mut doc, valve, "PIPES", Vector3::ZERO, Vector3::new(10., 0., 0.));
+        line(
+            &mut doc,
+            valve,
+            "PIPES",
+            Vector3::ZERO,
+            Vector3::new(10., 0., 0.),
+        );
         let mut insert = Insert::new("VALVE", Vector3::ZERO);
         insert.common.layer = "SYMBOLS".into();
         doc.add_entity(E::Insert(insert)).unwrap();
-        let result = recognize(&doc, &Options { layers: vec!["PIPES".into()], ..Default::default() });
+        let result = recognize(
+            &doc,
+            &Options {
+                layers: vec!["PIPES".into()],
+                ..Default::default()
+            },
+        );
         assert_eq!(result["steps"], json!([]));
         assert_eq!(result["components"], json!([]));
+    }
+
+    #[test]
+    fn filtered_recognition_budget_ignores_unselected_model_space_entities() {
+        let mut doc = CadDocument::new();
+        for index in 0..=MAX_VISITS {
+            line(
+                &mut doc,
+                Handle::NULL,
+                "BACKGROUND",
+                Vector3::new(index as f64, 100.0, 0.0),
+                Vector3::new(index as f64 + 0.5, 100.0, 0.0),
+            );
+        }
+        line(
+            &mut doc,
+            Handle::NULL,
+            "DUCT_EDGE",
+            Vector3::new(0.0, 0.0, 0.0),
+            Vector3::new(100.0, 0.0, 0.0),
+        );
+        let result = recognize(
+            &doc,
+            &Options {
+                layers: vec!["DUCT_EDGE".into()],
+                tolerance: 0.01,
+                ..Default::default()
+            },
+        );
+        assert_eq!(result["complete"], true, "{result}");
+        assert_eq!(result["coverage"]["visits"], 1);
+        assert_eq!(result["steps"].as_array().unwrap().len(), 1);
     }
 
     #[test]

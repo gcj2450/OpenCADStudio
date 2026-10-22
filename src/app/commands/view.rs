@@ -997,14 +997,10 @@ impl OpenCADStudio {
                             vp.width = *w;
                             vp.height = *h;
                             vp.id = 2; // commit_entity will assign unique IDs
-                            match self.tabs[i]
-                                .scene
-                                .document
-                                .add_entity_to_layout(
-                                    codec::EntityType::Viewport(Box::new(vp)),
-                                    &layout_name,
-                                )
-                            {
+                            match self.tabs[i].scene.document.add_entity_to_layout(
+                                codec::EntityType::Viewport(Box::new(vp)),
+                                &layout_name,
+                            ) {
                                 Ok(handle) => {
                                     self.tabs[i].scene.auto_fit_viewport(handle);
                                 }

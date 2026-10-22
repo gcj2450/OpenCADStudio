@@ -547,15 +547,20 @@ pub(crate) fn eed_app_map(
 /// Re-point a copied entity's verbatim EED at this drawing's APPIDs. A block
 /// whose application the map does not know names no APPID here, and a DWG
 /// carrying one is rejected outright by the reference program, so it goes.
-pub(crate) fn remap_eed_apps(entity: &mut codec::EntityType, apps: &rustc_hash::FxHashMap<u64, u64>) {
+pub(crate) fn remap_eed_apps(
+    entity: &mut codec::EntityType,
+    apps: &rustc_hash::FxHashMap<u64, u64>,
+) {
     let remap = |xdata: &mut codec::xdata::ExtendedData| {
-        xdata.raw_dwg_eed.retain_mut(|(app, _)| match apps.get(app) {
-            Some(&target) => {
-                *app = target;
-                true
-            }
-            None => false,
-        });
+        xdata
+            .raw_dwg_eed
+            .retain_mut(|(app, _)| match apps.get(app) {
+                Some(&target) => {
+                    *app = target;
+                    true
+                }
+                None => false,
+            });
     };
     remap(&mut entity.common_mut().extended_data);
     if let codec::EntityType::Insert(insert) = entity {
@@ -1405,7 +1410,9 @@ mod paste_entities_kernel_tests {
     fn remaps_leader_annotation_link_to_pasted_handles() {
         let mut seed = codec::CadDocument::new();
         let note = seed
-            .add_entity(codec::EntityType::MText(Box::new(codec::entities::MText::new())))
+            .add_entity(codec::EntityType::MText(Box::new(
+                codec::entities::MText::new(),
+            )))
             .unwrap();
         let mut leader = codec::entities::Leader::default();
         leader.annotation_handle = note;

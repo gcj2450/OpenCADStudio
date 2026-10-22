@@ -13,14 +13,14 @@ mod annotation_data;
 mod block_editor;
 #[cfg(test)]
 mod block_editor_tests;
-mod block_save_as;
-mod block_visibility;
 mod block_properties;
 #[cfg(test)]
 mod block_properties_tests;
+mod block_save_as;
 mod block_test;
 #[cfg(test)]
 mod block_test_tests;
+mod block_visibility;
 mod command_driver;
 pub(crate) use command_driver::{
     copy_to_clipboard_kernel, define_block_raw_doc, paste_entities_kernel, PasteSpace,
@@ -2508,6 +2508,9 @@ pub enum Message {
     AgentPickAttachments,
     #[cfg(not(target_arch = "wasm32"))]
     AgentAttachmentsLoaded(Vec<Result<agent::AgentAttachment, String>>),
+    #[cfg(not(target_arch = "wasm32"))]
+    #[allow(private_interfaces)]
+    AgentDuctToolReady(serde_json::Value, serde_json::Value),
     #[cfg(not(target_arch = "wasm32"))]
     AgentRemoveAttachment(usize),
     #[cfg(not(target_arch = "wasm32"))]
@@ -5524,10 +5527,7 @@ impl OpenCADStudio {
         // Start-up is intentionally local and deterministic.  Welcome-page
         // supporters, video, discussion and thumbnail fetches are no longer
         // part of the editor boot path; CAD loading owns the first frame.
-        (
-            s,
-            Task::batch([open_main, focus_cmd, cli_open, script]),
-        )
+        (s, Task::batch([open_main, focus_cmd, cli_open, script]))
     }
 
     /// Single-window boot for the web build: no OS-window creation (the browser
